@@ -1,1775 +1,1633 @@
-'use strict';
-/* ============================================================
-   Internet Journey Simulator
-   ------------------------------------------------------------
-   Everything below is a SIMULATION. No real network traffic
-   is generated. All addresses, routes, AS numbers and servers
-   are illustrative teaching models.
-   ============================================================ */
+/* ============================================================================
+ * Internet Journey Simulator
+ * ----------------------------------------------------------------------------
+ * EVERYTHING in this file is a SIMULATION. No packet is ever sent anywhere:
+ * no DNS lookups, no sockets, no fetch(). The visuals are driven by an internal
+ * model of devices, IP/MAC addresses, ports, packets, routing tables, a NAT
+ * table, a DNS cache, ARP caches and TCP/TLS connection state.
+ *
+ *   1. Network model      devices, links, routing tables
+ *   2. Engines            NAT, DNS, ARP, packet construction / inspection views
+ *   3. Animator           requestAnimationFrame packet movement
+ *   4. Stage data         the journey as data (one entry per step)
+ *   5. Failure lab        fault injection that rewrites the plan
+ *   6. Renderers          SVG topology, inspector, tables, panels
+ *   7. Controller         step engine, playback, wiring, init
+ * ========================================================================== */
+(function () {
+  'use strict';
 
-/* ===========================
-   1. NETWORK MODEL (simulated)
-   =========================== */
+  /* ------------------------------------------------------------------------
+   * 0. Small helpers
+   * ---------------------------------------------------------------------- */
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  const hex2 = (n) => pad((n & 255).toString(16).toUpperCase(), 2);
 
-// Simulated Google address — NOT a real, fixed Google IP.
-const GOOGLE_IP = '142.250.72.14';
-const GOOGLE_IP_LABEL = '142.250.x.x (simulated)';
-
-const NET = {
-  lan: '192.168.1.0/24',
-  gateway: '192.168.1.1',
-  router: {
-    lanMac: 'AA:BB:CC:DD:EE:01',
-    lanIp: '192.168.1.1',
-    wanIp: '203.0.113.10',           // documentation range — simulated public IP
-    wanMac: 'AA:BB:CC:DD:EE:02',
-    ispGateway: '203.0.113.1',
-    upstreamDns: '203.0.113.53'
-  },
-  mobile: {
-    deviceIp: '10.1.2.3',            // private address on the mobile link
-    cgnatShared: '100.64.12.7',      // RFC 6598 carrier shared space (simulated)
-    publicIp: '198.51.100.7'         // documentation range — simulated carrier public IP
-  }
-};
-
-function makePC(n) {
-  const last = 19 + n;               // PC1 → .20 … PC5 → .24
-  return {
-    id: 'pc' + n,
-    name: 'PC' + n,
-    type: 'computer',
-    ip: '192.168.1.' + last,
-    mac: '02:42:AC:11:00:' + String(last),
-    subnet: NET.lan,
-    gateway: NET.gateway,
-    dns: NET.gateway,
-    connection: 'Wi-Fi'
-  };
-}
-const PCS = [1, 2, 3, 4, 5].map(makePC);
-
-/* ===========================
-   2. SIMULATION STATE
-   =========================== */
-
-const sim = {
-  mode: 'wifi',            // 'wifi' | 'mobile'
-  clientNum: 3,            // selected PC (1-5)
-  domain: 'google.com',
-  step: -1,
-  playing: false,
-  speed: 1,
-  level: 'beginner',
-  failure: 'none',
-  multi: false,
-  stopped: false,          // fatal failure reached
-  animating: false,
-  nat: [],                 // NAT table entries
-  dns: {},                 // DNS cache
-  arp: {},                 // ARP cache
-  stats: { packets: 0, retries: 0, roundTrips: 4 },
-  timers: [],              // pending timeouts (for clean reset)
-  anim: null               // current animation handle
-};
-
-const el = id => document.getElementById(id);
-const client = () => PCS[sim.clientNum - 1];
-const isWifi = () => sim.mode === 'wifi';
-const clientLabel = () => isWifi() ? client().name : 'Phone';
-const clientIp = () => isWifi() ? client().ip : NET.mobile.deviceIp;
-const clientMac = () => isWifi() ? client().mac : 'cellular link (no MAC/ARP)';
-const clientPort = () => sim.multi && isWifi() ? 50000 + sim.clientNum : 52143;
-const publicPort = () => sim.multi && isWifi() ? 40000 + sim.clientNum : 40001;
-const publicIp = () => isWifi() ? NET.router.wanIp : NET.mobile.publicIp;
-const natDeviceName = () => isWifi() ? 'home router' : 'carrier CGNAT';
-
-/* ===========================
-   3. LOGGING + TIMERS
-   =========================== */
-
-function now() {
-  const d = new Date();
-  const p = n => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-function log(msg, cls = 'sys') {
-  const li = document.createElement('li');
-  li.className = cls;
-  const ts = document.createElement('span');
-  ts.className = 'ts';
-  ts.textContent = `[${now()}] `;
-  li.appendChild(ts);
-  li.appendChild(document.createTextNode(msg));
-  el('event-log').appendChild(li);
-  el('event-log').scrollTop = el('event-log').scrollHeight;
-}
-
-// Tracked timeout so Reset can clean up everything (no leaked timers).
-function wait(ms) {
-  return new Promise(resolve => {
-    const id = setTimeout(() => { resolve(); }, ms);
-    sim.timers.push({ id, resolve });
-  });
-}
-
-function clearTimers() {
-  sim.timers.forEach(t => { clearTimeout(t.id); t.resolve(); });
-  sim.timers = [];
-}
-
-/* ===========================
-   4. TOPOLOGY LAYOUTS (SVG)
-   =========================== */
-
-// Node: {id,name,icon,x,y,ip,sub,type,as?}
-function wifiLayout() {
-  const pcs = PCS.map((p, i) => ({
-    id: p.id, name: p.name, icon: '💻', x: 170 + i * 170, y: 95,
-    ip: p.ip, type: 'computer', ref: p
-  }));
-  return {
-    nodes: [
-      ...pcs,
-      { id: 'router', name: 'Wi-Fi Router', icon: '📡', x: 510, y: 260, ip: NET.router.lanIp, sub: 'WAN: ' + NET.router.wanIp + ' (simulated)', type: 'router' },
-      { id: 'isp', name: 'Your ISP', icon: '🏢', x: 170, y: 470, ip: 'AS64500', type: 'isp' },
-      { id: 'r1', name: 'R1', icon: '🛣', x: 330, y: 470, ip: 'AS64500', type: 'irouter' },
-      { id: 'r2', name: 'R2', icon: '🛣', x: 490, y: 470, ip: 'AS64501', type: 'irouter' },
-      { id: 'r3', name: 'R3', icon: '🛣', x: 650, y: 470, ip: 'AS64501', type: 'irouter' },
-      { id: 'r4', name: 'R4', icon: '🛣', x: 810, y: 470, ip: 'AS64501', type: 'irouter' },
-      { id: 'edge', name: 'Google Edge', icon: '🏢', x: 960, y: 470, ip: 'AS15169 · anycast (simulated)', type: 'edge' },
-      { id: 'server', name: 'Google Server', icon: '🖥', x: 1110, y: 470, ip: GOOGLE_IP_LABEL, type: 'server' }
-    ],
-    links: [
-      ...PCS.map(p => ['pc' === '' ? null : p.id, 'router'].filter(Boolean)),
-      ['router', 'isp'], ['isp', 'r1'], ['r1', 'r2'], ['r2', 'r3'],
-      ['r3', 'r4'], ['r4', 'edge'], ['edge', 'server']
-    ]
-  };
-}
-
-function mobileLayout() {
-  return {
-    nodes: [
-      { id: 'client', name: 'Phone / Client', icon: '📱', x: 170, y: 80, ip: NET.mobile.deviceIp + ' (private)', type: 'mdevice' },
-      { id: 'tower', name: 'Cell Tower', icon: '📡', x: 170, y: 190, ip: 'radio access', type: 'tower' },
-      { id: 'core', name: 'Mobile Core', icon: '🏢', x: 170, y: 305, ip: 'operator network', type: 'core' },
-      { id: 'cgnat', name: 'CGNAT', icon: '🔀', x: 170, y: 420, ip: '100.64.x pool → ' + NET.mobile.publicIp, type: 'cgnat' },
-      { id: 'isp', name: 'Carrier → Internet', icon: '🌐', x: 170, y: 545, ip: 'AS64500', type: 'isp' },
-      { id: 'r1', name: 'R1', icon: '🛣', x: 350, y: 545, ip: 'AS64501', type: 'irouter' },
-      { id: 'r2', name: 'R2', icon: '🛣', x: 520, y: 545, ip: 'AS64501', type: 'irouter' },
-      { id: 'edge', name: 'Google Edge', icon: '🏢', x: 740, y: 545, ip: 'AS15169 · anycast (simulated)', type: 'edge' },
-      { id: 'server', name: 'Google Server', icon: '🖥', x: 950, y: 545, ip: GOOGLE_IP_LABEL, type: 'server' }
-    ],
-    links: [
-      ['client', 'tower'], ['tower', 'core'], ['core', 'cgnat'],
-      ['cgnat', 'isp'], ['isp', 'r1'], ['r1', 'r2'],
-      ['r2', 'edge'], ['edge', 'server']
-    ]
-  };
-}
-
-let layout = null;
-const nodeById = id => layout.nodes.find(n => n.id === id);
-
-function renderTopology() {
-  layout = isWifi() ? wifiLayout() : mobileLayout();
-  const svg = el('net');
-  svg.innerHTML = '';
-
-  // Backbone label
-  const bb = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-  bb.setAttribute('x', 600); bb.setAttribute('y', isWifi() ? 425 : 500);
-  bb.setAttribute('text-anchor', 'middle');
-  bb.setAttribute('fill', '#8a6d33'); bb.setAttribute('font-size', '10');
-  bb.textContent = 'SIMULATED INTERNET PATH — not a real traceroute';
-  svg.appendChild(bb);
-
-  // Links
-  layout.links.forEach(([a, b]) => {
-    const na = nodeById(a), nb = nodeById(b);
-    if (!na || !nb) return;
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('x1', na.x); line.setAttribute('y1', na.y);
-    line.setAttribute('x2', nb.x); line.setAttribute('y2', nb.y);
-    line.setAttribute('class', 'link');
-    line.dataset.link = a + '|' + b;
-    svg.appendChild(line);
-  });
-
-  // Nodes
-  layout.nodes.forEach(n => {
-    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    g.setAttribute('class', 'node' + (n.id === 'pc' + sim.clientNum && isWifi() ? ' selected' : ''));
-    g.setAttribute('transform', `translate(${n.x},${n.y})`);
-    g.setAttribute('tabindex', '0');
-    g.setAttribute('role', 'button');
-    g.setAttribute('aria-label', n.name + (n.ip ? ', ' + n.ip : ''));
-    g.dataset.node = n.id;
-
-    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    c.setAttribute('class', 'body'); c.setAttribute('r', '26');
-    g.appendChild(c);
-
-    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    icon.setAttribute('class', 'icon'); icon.setAttribute('y', '7');
-    icon.textContent = n.icon;
-    g.appendChild(icon);
-
-    const name = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    name.setAttribute('y', '44');
-    name.textContent = n.name + (isWifi() && n.id === 'pc' + sim.clientNum ? ' ⭐' : '');
-    g.appendChild(name);
-
-    if (n.ip) {
-      const ip = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      ip.setAttribute('class', 'ip'); ip.setAttribute('y', '57');
-      ip.textContent = n.ip;
-      g.appendChild(ip);
-    }
-    if (n.sub) {
-      const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      sub.setAttribute('class', 'ip'); sub.setAttribute('y', '69');
-      sub.textContent = n.sub;
-      g.appendChild(sub);
-    }
-
-    g.addEventListener('click', () => openNodeModal(n.id));
-    g.addEventListener('keydown', e => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openNodeModal(n.id); }
+  function appendKids(node, kids) {
+    if (kids === undefined || kids === null || kids === false) return;
+    (Array.isArray(kids) ? kids : [kids]).forEach((k) => {
+      if (k === undefined || k === null || k === false) return;
+      if (Array.isArray(k)) appendKids(node, k);
+      else node.appendChild(typeof k === 'object' ? k : document.createTextNode(String(k)));
     });
-    svg.appendChild(g);
-  });
+  }
+  function applyAttrs(node, attrs) {
+    if (!attrs) return;
+    Object.keys(attrs).forEach((k) => {
+      const v = attrs[k];
+      if (v === undefined || v === null || v === false) return;
+      if (k.slice(0, 2) === 'on' && typeof v === 'function') node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v === true ? '' : String(v));
+    });
+  }
+  /** Create an HTML element. Text is always inserted as text nodes (never as HTML). */
+  function el(tag, attrs, kids) {
+    const n = document.createElement(tag);
+    applyAttrs(n, attrs);
+    appendKids(n, kids);
+    return n;
+  }
+  /** Create an SVG element. */
+  function svg(tag, attrs, kids) {
+    const n = document.createElementNS(SVG_NS, tag);
+    applyAttrs(n, attrs);
+    appendKids(n, kids);
+    return n;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function setText(node, text) { if (node && node.textContent !== text) node.textContent = text; }
 
-  rebuildRoutingSelect();
-}
+  /** Deterministic pseudo-random bytes so "simulated keys" look identical every run. */
+  function fakeHex(seed, bytes) {
+    let x = (seed * 2654435761) >>> 0;
+    const out = [];
+    for (let i = 0; i < bytes; i++) { x = (x * 1664525 + 1013904223) >>> 0; out.push(hex2(x >>> 24).toLowerCase()); }
+    return out.join(' ');
+  }
+  function fmtClock(ms) {
+    const d = new Date(ms);
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '.' + pad(d.getMilliseconds(), 3);
+  }
 
-// Visual helpers on the SVG
-function svgNode(id) { return el('net').querySelector(`[data-node="${id}"]`); }
-function highlightNodes(ids) {
-  el('net').querySelectorAll('.node').forEach(g => g.classList.remove('active'));
-  ids.forEach(id => { const g = svgNode(id); if (g) g.classList.add('active'); });
-}
-function dimOtherPCs(dim) {
-  PCS.forEach(p => {
-    const g = svgNode(p.id);
-    if (!g) return;
-    if (dim && p.id !== 'pc' + sim.clientNum) g.classList.add('dimmed');
-    else g.classList.remove('dimmed');
-  });
-  const sel = svgNode('pc' + sim.clientNum);
-  if (sel) sel.classList.toggle('receiver', dim);
-}
-function markLink(a, b, on) {
-  el('net').querySelectorAll('.link').forEach(l => {
-    const [x, y] = l.dataset.link.split('|');
-    if ((x === a && y === b) || (x === b && y === a)) l.classList.toggle('active', on);
-  });
-}
+  /** Tracked timers: every timeout is registered so Reset can clean up. */
+  const timers = new Set();
+  function later(fn, ms) {
+    const id = setTimeout(() => { timers.delete(id); fn(); }, ms);
+    timers.add(id);
+    return id;
+  }
+  function clearTimers() { timers.forEach((id) => clearTimeout(id)); timers.clear(); }
 
-/* ===========================
-   5. PACKET ANIMATION
-   =========================== */
+  const reducedMQ = (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)')) || { matches: false };
+  const prefersReducedMotion = () => !!reducedMQ.matches;
 
-const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  /* ------------------------------------------------------------------------
+   * 1. Network model
+   * ---------------------------------------------------------------------- */
+  const PUBLIC_IP = { wifi: '203.0.113.10', mobile: '203.0.113.77' };   // documentation range (RFC 5737)
+  const SPEEDS = [0.5, 1, 2, 4];
 
-// Remove any in-flight packet sprites.
-function clearPackets() {
-  if (sim.anim) { cancelAnimationFrame(sim.anim.raf); sim.anim.resolve(); sim.anim = null; }
-  el('net').querySelectorAll('.pkt').forEach(p => p.remove());
-}
+  class NetNode {
+    constructor(o) {
+      Object.assign(this, {
+        id: '', name: '', sub: '', type: 'node', icon: '❓', ip: null, mac: null, macs: null,
+        interfaces: [], routingTable: [], as: null, l3: false, transparent: false,
+        status: 'online', role: '', notes: ''
+      }, o);
+    }
+  }
+  class Computer extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'computer', icon: '💻' }, o)); this.hostname = this.hostname || this.name; }
+  }
+  class Router extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'router', icon: '📡', l3: true }, o)); }
+  }
+  /** Layer-2 device: forwards frames by destination MAC and never rewrites them. */
+  class Switch extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'switch', icon: '📶', transparent: true }, o)); }
+  }
+  class ISPRouter extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'isp', icon: '🏢', l3: true }, o)); }
+  }
+  class InternetRouter extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'internet', icon: '🛣', l3: true }, o)); }
+  }
+  class GoogleEdge extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'edge', icon: '🌐', l3: true }, o)); }
+  }
+  class GoogleServer extends NetNode {
+    constructor(o) { super(Object.assign({ type: 'server', icon: '🖥' }, o)); }
+  }
 
-/**
- * Animate a packet along a path of node ids.
- * opts: {label, dir('req'|'res'), perHop(ms), changes:{nodeId:newLabel},
- *        hopLogs:{nodeId:'log text'}, dropAt:nodeId}
- */
-function animatePacket(path, opts = {}) {
-  return new Promise(resolve => {
-    const pts = path.map(nodeById).filter(Boolean);
-    if (pts.length < 2 || REDUCED) { resolve(); return; }
+  const fm = (n) => '00:1B:44:' + hex2(n * 17) + ':' + hex2(n * 29) + ':' + hex2(n * 43);   // filler MACs
+  const route = (dest, next, iface, as) => ({ dest, next, iface, as: as || '—' });
 
-    const perHop = (opts.perHop || 380) / sim.speed;
-    const svg = el('net');
+  /** The destination network. Anything that is not google.com uses a clearly-labelled illustrative range. */
+  function destFor(domain) {
+    if (/^(www\.)?google\.com$/.test(domain)) {
+      return { name: 'Google', ip: '142.250.x.x', prefix: '142.250.0.0/16', as: 15169, asName: 'Google', real: true };
+    }
+    return { name: domain, ip: '198.18.x.x', prefix: '198.18.0.0/15', as: 64511, asName: 'Destination network', real: false };
+  }
 
-    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    g.setAttribute('class', 'pkt ' + (opts.dir === 'res' ? 'pkt-res' : 'pkt-req'));
-
-    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    dot.setAttribute('r', '8');
-    g.appendChild(dot);
-
-    const hit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    hit.setAttribute('r', '18');
-    hit.setAttribute('fill', 'transparent');
-    hit.style.pointerEvents = 'all';
-    hit.addEventListener('click', () => switchTab('inspector'));
-    g.appendChild(hit);
-
-    const labelBg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    labelBg.setAttribute('class', 'node-label-bg');
-    g.appendChild(labelBg);
-
-    const txt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    txt.textContent = opts.label || '';
-    g.appendChild(txt);
-
-    svg.appendChild(g);
-    sim.stats.packets++;
-
-    const placeLabel = s => {
-      txt.textContent = s;
-      const w = Math.max(24, s.length * 6.4 + 10);
-      labelBg.setAttribute('x', -w / 2); labelBg.setAttribute('y', -30);
-      labelBg.setAttribute('width', w); labelBg.setAttribute('height', 15);
-      labelBg.setAttribute('rx', 4);
-      txt.setAttribute('y', -19);
+  /**
+   * Build the simulated network for a connection type.
+   * The "spine" is the ordered list of nodes a packet crosses from the client to the server.
+   * Roles (client, l2, gw, nat, ispA..ispC, r1..r4, edge, server) let the stage data stay
+   * identical for Wi-Fi and mobile: each mode maps the roles onto different devices.
+   */
+  function buildNetwork(mode, clientId, dest) {
+    const net = {
+      mode, nodes: {}, layout: {}, spine: [], roles: {}, groups: [], bands: [], links: [], linkKinds: {},
+      width: 1240, height: 560, midY: 280, natBoundaryAfter: null
     };
-    placeLabel(opts.label || '');
+    const put = (node, x, y) => { net.nodes[node.id] = node; net.layout[node.id] = { x, y }; return node; };
+    const link = (a, b, kind) => { net.links.push({ a, b, kind }); net.linkKinds[[a, b].sort().join('|')] = kind; };
+    const brand = dest.name;
+    const asChain = '64500 → 64501 → ' + dest.as;
 
-    let seg = 0, start = null;
-    const total = pts.length - 1;
-
-    const stepFn = ts => {
-      if (start === null) start = ts;
-      const t = Math.min(1, (ts - start) / perHop);
-      const a = pts[seg], b = pts[seg + 1];
-      const x = a.x + (b.x - a.x) * t;
-      const y = a.y + (b.y - a.y) * t;
-      g.setAttribute('transform', `translate(${x},${y})`);
-
-      if (t >= 1) {
-        markLink(path[seg], path[seg + 1], true);
-        const arrived = path[seg + 1];
-        if (opts.changes && opts.changes[arrived]) placeLabel(opts.changes[arrived]);
-        if (opts.hopLogs && opts.hopLogs[arrived]) log(opts.hopLogs[arrived]);
-        if (opts.dropAt === arrived) {
-          g.setAttribute('class', 'pkt pkt-dropped');
-          txt.textContent = '✕ dropped';
-          sim.anim = null;
-          setTimeout(() => { g.remove(); resolve(); }, 900 / sim.speed);
-          return;
-        }
-        seg++;
-        start = ts;
-        if (seg >= total) {
-          g.remove();
-          sim.anim = null;
-          resolve();
-          return;
-        }
+    // ---- Wi-Fi: five computers behind one home router --------------------------------------------
+    if (mode === 'wifi') {
+      const ys = [80, 180, 280, 380, 480];
+      for (let i = 1; i <= 5; i++) {
+        put(new Computer({
+          id: 'pc' + i, name: 'PC' + i, sub: '192.168.1.' + (19 + i), ip: '192.168.1.' + (19 + i),
+          mac: '02:42:AC:11:00:' + (19 + i), subnet: '192.168.1.0/24', gateway: '192.168.1.1', dns: '192.168.1.1',
+          connection: 'Wi-Fi', lease: '24 h from DHCP server 192.168.1.1'
+        }), 70, ys[i - 1]);
       }
-      sim.anim = { raf: requestAnimationFrame(stepFn), resolve };
+      put(new Switch({
+        id: 'ap', name: 'Wi-Fi AP', sub: 'L2 switch', mac: 'AA:BB:CC:DD:EE:0A',
+        role: 'Wireless access point and Ethernet switch built into the home router. It forwards frames by destination MAC address and never rewrites them.'
+      }), 215, 280);
+      put(new Router({
+        id: 'router', name: 'Home Router', sub: '192.168.1.1', ip: '192.168.1.1', wanIp: PUBLIC_IP.wifi,
+        mac: 'AA:BB:CC:DD:EE:01', macs: { lan: 'AA:BB:CC:DD:EE:01', wan: 'AA:BB:CC:DD:EE:02' },
+        interfaces: [
+          { name: 'LAN (eth0)', ip: '192.168.1.1/24', mac: 'AA:BB:CC:DD:EE:01' },
+          { name: 'WAN (eth1)', ip: PUBLIC_IP.wifi, mac: 'AA:BB:CC:DD:EE:02' }
+        ],
+        routingTable: [
+          route('192.168.1.0/24', 'LAN (directly connected)', 'eth0'),
+          route('0.0.0.0/0', 'ISP access router (198.51.100.1)', 'eth1')
+        ],
+        role: 'Default gateway, DHCP server, DNS forwarder and NAT device for the home network.'
+      }), 325, 280);
+      put(new ISPRouter({
+        id: 'isp-acc', name: 'ISP Access', sub: 'AS64500', ip: '198.51.100.1', mac: fm(1), as: 64500,
+        interfaces: [{ name: 'to customer', ip: '198.51.100.1', mac: fm(1) }],
+        routingTable: [route('203.0.113.0/24', 'Home router (customer)', 'cust0', '—'), route('0.0.0.0/0', 'ISP aggregation (198.51.100.2)', 'up0', '—')],
+        role: 'Access router: terminates the customer connection.'
+      }), 445, 280);
+      put(new ISPRouter({
+        id: 'isp-agg', name: 'ISP Aggregation', sub: 'AS64500', ip: '198.51.100.2', mac: fm(2), as: 64500,
+        routingTable: [route('203.0.113.0/24', 'ISP access (198.51.100.1)', 'down0', '—'), route('0.0.0.0/0', 'ISP core (198.51.100.3)', 'up0', '—')],
+        role: 'Aggregation router: combines many access routers.'
+      }), 535, 280);
+      put(new ISPRouter({
+        id: 'isp-core', name: 'ISP Core', sub: 'AS64500', ip: '198.51.100.3', mac: fm(3), as: 64500,
+        routingTable: [route('203.0.113.0/24', 'ISP aggregation (198.51.100.2)', 'down0', '—'), route(dest.prefix, 'R1 (192.0.2.1)', 'peer0', '64501 ' + dest.as)],
+        role: 'Core router: fast forwarding towards other networks. Also hosts the ISP recursive DNS resolver (198.51.100.53) in this simulation.'
+      }), 625, 280);
+      net.spine = [clientId, 'ap', 'router', 'isp-acc', 'isp-agg', 'isp-core'];
+      Object.assign(net.roles, { client: clientId, l2: 'ap', gw: 'router', nat: 'router', ispA: 'isp-acc', ispB: 'isp-agg', ispC: 'isp-core' });
+      link(clientId, 'ap', 'wifi');
+      ['pc1', 'pc2', 'pc3', 'pc4', 'pc5'].forEach((id) => link(id, 'ap', 'wifi'));
+      link('ap', 'router', 'ethernet'); link('router', 'isp-acc', 'ethernet'); link('isp-acc', 'isp-agg', 'ethernet'); link('isp-agg', 'isp-core', 'ethernet');
+      net.groups.push({ label: 'Home router (all-in-one)', ids: ['ap', 'router'], cls: 'home' });
+      net.groups.push({ label: 'ISP · AS64500', ids: ['isp-acc', 'isp-agg', 'isp-core'], cls: 'isp' });
+      net.natBoundaryAfter = 'router';
+      net.xs = { r1: 730, r2: 815, r3: 900, r4: 985, edge: 1085, server: 1170 };
+      net.lastIspId = 'isp-core';
+      net.bands.push({ label: 'AS64500 · ISP', from: 'isp-acc', to: 'r1', key: 'isp' });
+    } else {
+      // ---- Mobile data: phone → tower → mobile core → CGNAT → ISP ---------------------------------
+      put(new Computer({
+        id: 'phone', name: 'Phone', sub: '100.72.14.9', ip: '100.72.14.9', mac: null, icon: '📱', subnet: '—', gateway: null,
+        dns: '100.64.0.53', connection: 'Mobile data (4G/5G)', lease: 'Assigned by the mobile core when the data session started'
+      }), 80, 280);
+      put(new Switch({
+        id: 'tower', type: 'tower', icon: '🗼', name: 'Cell Tower', sub: 'radio access', mac: null,
+        role: 'Radio base station. It carries the phone’s IP packets to the mobile core inside a GTP-U tunnel; there is no Ethernet or ARP on the radio link.'
+      }), 220, 280);
+      put(new Router({
+        id: 'mcore', type: 'core', icon: '🏢', name: 'Mobile Core', sub: 'gateway (UPF)', ip: '100.72.0.1', mac: fm(21),
+        interfaces: [{ name: 'radio side (N3/GTP-U)', ip: '100.72.0.1', mac: '—' }, { name: 'Internet side', ip: '10.255.0.1', mac: fm(21) }],
+        routingTable: [route('100.72.0.0/16', 'subscriber sessions (GTP tunnels)', 'n3', '—'), route('0.0.0.0/0', 'CGNAT (10.255.0.2)', 'sgi0', '—')],
+        role: 'Packet core: assigns IP addresses, tunnels subscriber traffic and acts as the phone’s gateway.'
+      }), 335, 280);
+      put(new Router({
+        id: 'cgnat', type: 'cgnat', icon: '🔁', name: 'CGNAT', sub: 'carrier NAT', ip: '10.255.0.2', wanIp: PUBLIC_IP.mobile, mac: fm(22),
+        interfaces: [{ name: 'inside', ip: '10.255.0.2', mac: fm(22) }, { name: 'outside', ip: PUBLIC_IP.mobile, mac: fm(23) }],
+        routingTable: [route('100.72.0.0/16', 'Mobile core (10.255.0.1)', 'in0', '—'), route('0.0.0.0/0', 'ISP / transit (198.51.100.1)', 'out0', '—')],
+        role: 'Carrier-grade NAT: many subscribers share a small pool of public IPv4 addresses.'
+      }), 450, 280);
+      put(new ISPRouter({
+        id: 'isp', name: 'ISP / Transit', sub: 'AS64500', ip: '198.51.100.1', mac: fm(24), as: 64500,
+        routingTable: [route('203.0.113.0/24', 'CGNAT (customer pool)', 'cust0', '—'), route(dest.prefix, 'R1 (192.0.2.1)', 'peer0', '64501 ' + dest.as)],
+        role: 'The carrier’s Internet-facing network. Also hosts the recursive DNS resolver in this simulation.'
+      }), 575, 280);
+      net.spine = [clientId, 'tower', 'mcore', 'cgnat', 'isp'];
+      Object.assign(net.roles, { client: clientId, l2: 'tower', gw: 'mcore', nat: 'cgnat', ispA: 'isp', ispB: 'isp', ispC: 'isp' });
+      link(clientId, 'tower', 'radio'); link('tower', 'mcore', 'radio'); link('mcore', 'cgnat', 'ethernet'); link('cgnat', 'isp', 'ethernet');
+      net.groups.push({ label: 'Mobile network (carrier)', ids: ['tower', 'mcore', 'cgnat'], cls: 'home' });
+      net.groups.push({ label: 'ISP · AS64500', ids: ['isp'], cls: 'isp' });
+      net.natBoundaryAfter = 'cgnat';
+      net.xs = { r1: 685, r2: 775, r3: 865, r4: 955, edge: 1070, server: 1165 };
+      net.lastIspId = 'isp';
+      net.bands.push({ label: 'AS64500 · ISP', from: 'isp', to: 'r1', key: 'isp' });
+    }
+
+    // ---- Shared Internet side: R1..R4 → edge → server ---------------------------------------------
+    const rs = ['r1', 'r2', 'r3', 'r4'];
+    const asOf = { r1: 64500, r2: 64501, r3: 64501, r4: 64501 };
+    const prevOf = { r1: net.lastIspId, r2: 'r1', r3: 'r2', r4: 'r3' };
+    const nextOf = { r1: 'r2', r2: 'r3', r3: 'r4', r4: 'edge' };
+    const ips = { r1: '192.0.2.1', r2: '192.0.2.2', r3: '192.0.2.3', r4: '192.0.2.4' };
+    const asPathSeen = { r1: '64501 ' + dest.as, r2: String(dest.as), r3: String(dest.as), r4: String(dest.as) };
+    rs.forEach((id, i) => {
+      const nextName = nextOf[id] === 'edge' ? brand + ' Edge' : nextOf[id].toUpperCase();
+      const prevName = net.nodes[prevOf[id]] ? net.nodes[prevOf[id]].name : prevOf[id].toUpperCase();
+      put(new InternetRouter({
+        id, name: 'R' + (i + 1), sub: 'AS' + asOf[id], ip: ips[id], mac: fm(30 + i), as: asOf[id],
+        interfaces: [{ name: 'eth0 (towards client)', ip: ips[id], mac: fm(30 + i) }, { name: 'eth1 (towards server)', ip: '192.0.2.' + (10 + i), mac: fm(40 + i) }],
+        routingTable: [
+          route(dest.prefix, nextName + ' (' + (nextOf[id] === 'edge' ? 'edge' : ips[nextOf[id]]) + ')', 'eth1', asPathSeen[id]),
+          route('203.0.113.0/24', prevName, 'eth0', '64500 (customer)')
+        ],
+        asPath: asChain,
+        role: 'Simulated Internet router. Not a real hop on any real route.'
+      }), net.xs[id], 280);
+    });
+    put(new GoogleEdge({
+      id: 'edge', name: brand + ' Edge', sub: 'anycast', ip: dest.ip, mac: fm(50), as: dest.as,
+      routingTable: [route(dest.prefix, 'internal network → ' + brand + ' Server', 'int0', String(dest.as))],
+      role: 'Edge location. Large services announce the same address from many places (anycast) and terminate connections close to users.'
+    }), net.xs.edge, 280);
+    put(new GoogleServer({
+      id: 'server', name: brand + ' Server', sub: 'HTTPS :443', ip: dest.ip, mac: fm(51), as: dest.as,
+      role: 'Simulated web server that answers HTTPS requests on port 443.'
+    }), net.xs.server, 280);
+    net.spine = net.spine.concat(['r1', 'r2', 'r3', 'r4', 'edge', 'server']);
+    Object.assign(net.roles, { r1: 'r1', r2: 'r2', r3: 'r3', r4: 'r4', edge: 'edge', server: 'server' });
+    link(net.lastIspId, 'r1', 'ethernet'); link('r1', 'r2', 'ethernet'); link('r2', 'r3', 'ethernet'); link('r3', 'r4', 'ethernet');
+    link('r4', 'edge', 'ethernet'); link('edge', 'server', 'ethernet');
+    net.groups.push({ label: 'SIMULATED INTERNET PATH · not a real traceroute', ids: rs, cls: 'internet' });
+    net.groups.push({ label: brand + ' network (simulated)', ids: ['edge', 'server'], cls: 'dest' });
+    net.bands.push({ label: 'AS64501 · Transit', from: 'r2', to: 'r4', key: 'transit' });
+    net.bands.push({ label: 'AS' + dest.as + ' · ' + (dest.real ? 'Google' : 'Destination (simulated)'), from: 'edge', to: 'server', key: 'dest' });
+    net.spineIndex = {};
+    net.spine.forEach((id, i) => { net.spineIndex[id] = i; });
+
+    /** Ordered node ids between two node ids (either direction). */
+    net.between = (a, b) => {
+      const i = net.spine.indexOf(a), j = net.spine.indexOf(b);
+      if (i < 0 || j < 0) return [a, b];
+      return i <= j ? net.spine.slice(i, j + 1) : net.spine.slice(j, i + 1).reverse();
     };
-    sim.anim = { raf: requestAnimationFrame(stepFn), resolve };
-  });
-}
-
-/* ===========================
-   6. PANEL RENDERERS
-   =========================== */
-
-function renderNat() {
-  const tb = el('nat-rows');
-  tb.innerHTML = '';
-  if (!sim.nat.length) {
-    el('nat-note').textContent = 'Empty — created when the ' + natDeviceName() + ' translates the first outbound packet.';
-    return;
+    net.linkKind = (a, b) => net.linkKinds[[a, b].sort().join('|')] || 'ethernet';
+    return net;
   }
-  el('nat-note').textContent = sim.multi
-    ? 'All 5 PCs share ONE public IP. The router tells connections apart by the public port.'
-    : 'Created at the NAT stage. The ' + natDeviceName() + ' rewrites source IP/port and remembers the mapping.';
-  sim.nat.forEach(e => {
-    const tr = document.createElement('tr');
-    if (e.current) tr.className = 'current';
-    const mk = txt => { const td = document.createElement('td'); td.textContent = txt; return td; };
-    tr.appendChild(mk(`${e.internalIp}:${e.internalPort}`));
-    tr.appendChild(mk('→'));
-    tr.appendChild(mk(`${e.publicIp}:${e.publicPort}`));
-    tr.appendChild(mk(e.dest + ' (simulated)'));
-    tb.appendChild(tr);
-  });
-}
 
-function renderDns() {
-  const tb = el('dns-rows');
-  tb.innerHTML = '';
-  const names = Object.keys(sim.dns);
-  el('dns-note').textContent = names.length ? 'Cached answer — reused until the TTL expires.' : 'Empty.';
-  names.forEach(name => {
-    const e = sim.dns[name];
-    const tr = document.createElement('tr');
-    [name, e.type, e.value + ' (simulated)', e.ttl + 's'].forEach(v => {
-      const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
+  /* --- Simplified longest-prefix-match so the router's decision is computed, not scripted ---------- */
+  function ipToNum(ip) {
+    const p = ip.split('.').map((x) => (x === 'x' ? 0 : parseInt(x, 10)));
+    return ((p[0] << 24) >>> 0) + (p[1] << 16) + (p[2] << 8) + p[3];
+  }
+  function inCidr(ip, cidr) {
+    const parts = cidr.split('/');
+    if (parts.length !== 2) return false;
+    const bits = +parts[1];
+    if (bits === 0) return true;
+    const mask = (0xFFFFFFFF << (32 - bits)) >>> 0;
+    return ((ipToNum(ip) & mask) >>> 0) === ((ipToNum(parts[0]) & mask) >>> 0);
+  }
+  function lookupRoute(table, ip) {
+    let best = null, bestBits = -1;
+    table.forEach((r) => {
+      if (inCidr(ip, r.dest)) { const b = +r.dest.split('/')[1]; if (b > bestBits) { best = r; bestBits = b; } }
     });
-    tb.appendChild(tr);
-  });
-}
-
-function renderArp() {
-  const tb = el('arp-rows');
-  tb.innerHTML = '';
-  const keys = Object.keys(sim.arp);
-  el('arp-note').textContent = keys.length ? 'Learned via ARP — local network only. ARP never crosses the Internet.' : 'Empty — populated during the ARP stage.';
-  keys.forEach(ip => {
-    const tr = document.createElement('tr');
-    [ip, sim.arp[ip]].forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
-    tb.appendChild(tr);
-  });
-}
-
-const ROUTING_TABLES = {
-  wifi: {
-    router: {
-      note: 'Home router. Longest-prefix match; no LAN match → default route to the ISP.',
-      rows: [['192.168.1.0/24', 'directly connected (LAN)', 'wlan0'],
-             ['0.0.0.0/0', NET.router.ispGateway + ' (ISP)', 'wan0']]
-    },
-    isp: {
-      note: 'ISP router (AS64500, simulated). Learned Google routes via BGP.',
-      rows: [[NET.router.wanIp + '/32', 'customer link', 'cust1'],
-             ['142.250.0.0/16', 'R1', 'core0', ], ['0.0.0.0/0', 'R1 (transit)', 'core0']]
-    },
-    r1: { note: 'Backbone R1 (AS64501). AS path so far: 64500 → 64501.', rows: [['142.250.0.0/16', 'R2', 'eth0']] },
-    r2: { note: 'Backbone R2 (AS64501). Next hop R3. Not a real traceroute.', rows: [['142.250.0.0/16', 'R3', 'eth1']] },
-    r3: { note: 'Backbone R3 (AS64501). Next hop R4.', rows: [['142.250.0.0/16', 'R4', 'eth1']] },
-    r4: { note: "R4 peers with Google's edge (AS15169) via BGP. AS path: 64500 → 64501 → 15169.", rows: [['142.250.0.0/16', 'Google Edge (AS15169)', 'peer0']] },
-    edge: { note: 'Google edge (simulated). Anycast can steer a user toward a nearby entry point.', rows: [['service VIPs', 'internal fabric', 'fabric0']] }
-  },
-  mobile: {
-    cgnat: {
-      note: 'Carrier-grade NAT. Many subscribers share a pool of public IPv4 addresses; your phone usually never holds a public IPv4 of its own.',
-      rows: [['10.0.0.0/8 (subscribers)', 'translate → 198.51.100.0/24 pool', 'nat0'],
-             ['0.0.0.0/0', 'carrier upstream', 'up0']]
-    },
-    isp: { note: 'Carrier edge into the public Internet (AS64500, simulated).', rows: [['142.250.0.0/16', 'R1', 'core0']] },
-    r1: { note: 'Transit router (AS64501, simulated).', rows: [['142.250.0.0/16', 'R2', 'eth0']] },
-    r2: { note: "R2 peers with Google's edge. AS path: 64500 → 64501 → 15169 (simulated).", rows: [['142.250.0.0/16', 'Google Edge (AS15169)', 'peer0']] },
-    edge: { note: 'Google edge (simulated). Anycast may pick a nearby entry point.', rows: [['service VIPs', 'internal fabric', 'fabric0']] }
-  }
-};
-
-function rebuildRoutingSelect() {
-  const sel = el('rt-select');
-  sel.innerHTML = '';
-  const defs = isWifi() ? ROUTING_TABLES.wifi : ROUTING_TABLES.mobile;
-  const names = isWifi()
-    ? { router: 'Home router', isp: 'ISP router', r1: 'R1', r2: 'R2 (AS64501)', r3: 'R3', r4: 'R4', edge: 'Google Edge' }
-    : { cgnat: 'Carrier CGNAT', isp: 'Carrier edge', r1: 'R1', r2: 'R2', edge: 'Google Edge' };
-  Object.keys(defs).forEach(k => {
-    const o = document.createElement('option');
-    o.value = k; o.textContent = names[k] || k;
-    sel.appendChild(o);
-  });
-  renderRouting(sel.value);
-}
-
-function renderRouting(key) {
-  const defs = isWifi() ? ROUTING_TABLES.wifi : ROUTING_TABLES.mobile;
-  const def = defs[key] || Object.values(defs)[0];
-  el('rt-note').textContent = def.note;
-  const tb = el('rt-rows');
-  tb.innerHTML = '';
-  def.rows.forEach(r => {
-    const tr = document.createElement('tr');
-    r.forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
-    tb.appendChild(tr);
-  });
-}
-
-/* ----- Packet inspector ----- */
-
-function setKv(containerSel, pairs) {
-  const dl = el(containerSel).querySelector('.kv');
-  dl.innerHTML = '';
-  pairs.forEach(([k, v]) => {
-    const dt = document.createElement('dt'); dt.textContent = k;
-    const dd = document.createElement('dd'); dd.textContent = v;
-    dl.appendChild(dt); dl.appendChild(dd);
-  });
-}
-
-const LIFECYCLE = ['CREATED', 'ENCAPSULATED', 'SENT', 'ROUTED', 'NAT TRANSLATED', 'FORWARDED', 'RECEIVED', 'DECAPSULATED'];
-
-function showPacket(pkt, dirLabel, lifecycleAt) {
-  el('insp-empty').hidden = true;
-  el('insp-body').hidden = false;
-  el('insp-dir-label').textContent = dirLabel;
-  setKv('insp-l7', pkt.l7 || [['—', 'no application data on this step']]);
-  setKv('insp-l4', pkt.l4 || [['—', 'n/a']]);
-  setKv('insp-l3', pkt.l3 || [['—', 'n/a']]);
-  setKv('insp-l2', pkt.l2 || [['—', 'n/a']]);
-  const ol = el('insp-lifecycle');
-  ol.innerHTML = '';
-  LIFECYCLE.forEach((s, i) => {
-    const li = document.createElement('li');
-    li.textContent = s;
-    li.className = i < lifecycleAt ? 'done' : (i === lifecycleAt ? 'now' : '');
-    ol.appendChild(li);
-  });
-}
-
-function hidePacket(msg) {
-  el('insp-empty').hidden = false;
-  el('insp-empty').textContent = msg || 'No packet on this step (local processing stage).';
-  el('insp-body').hidden = true;
-}
-
-/* ----- Encapsulation panel ----- */
-
-function renderEncap(direction) {
-  const box = el('encap-box');
-  box.innerHTML = '';
-  const wrap = [
-    { key: 'app', title: 'APPLICATION DATA', body: `HTTPS request  ████████████████████  (encrypted)` },
-    { key: 'transport', title: 'TCP SEGMENT', body: `TCP  src port ${clientPort()} → dst port 443` },
-    { key: 'internet', title: 'IP PACKET', body: `IPv4  ${clientIp()} → ${GOOGLE_IP} (simulated)` },
-    { key: 'link', title: isWifi() ? 'WI-FI / ETHERNET FRAME' : 'CELLULAR LINK FRAME', body: isWifi() ? `MAC  ${client().mac} → ${NET.router.lanMac}` : 'cellular link layer — no MAC/ARP on this hop' }
-  ];
-  const layers = direction === 'res' ? [...wrap].reverse() : wrap;
-  el('encap-cap').textContent = direction === 'res'
-    ? 'Receiving side: the frame is UNWRAPPED — link → IP → TCP → application.'
-    : 'Sending side: data is WRAPPED — application → TCP → IP → link. Click a layer to inspect it.';
-  layers.forEach((l, i) => {
-    const d = document.createElement('div');
-    d.className = 'encap-layer';
-    d.setAttribute('role', 'button');
-    d.setAttribute('tabindex', '0');
-    const t = document.createElement('span'); t.className = 'encap-title'; t.textContent = l.title;
-    const b = document.createElement('span'); b.textContent = l.body;
-    d.appendChild(t); d.appendChild(b);
-    const open = () => { activateLayer(l.key); switchTab('inspector'); };
-    d.addEventListener('click', open);
-    d.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
-    box.appendChild(d);
-    if (i < layers.length - 1) {
-      const ar = document.createElement('div');
-      ar.className = 'encap-arrow';
-      ar.textContent = '▼';
-      box.appendChild(ar);
-    }
-  });
-}
-
-function activateLayer(key) {
-  document.querySelectorAll('.layer-btn').forEach(b => b.classList.toggle('active', b.dataset.layer === key));
-  const map = { app: 'insp-l7', transport: 'insp-l4', internet: 'insp-l3', link: 'insp-l2' };
-  Object.values(map).forEach(id => el(id).classList.remove('flash'));
-  const target = el(map[key]);
-  void target.offsetWidth; // restart CSS transition
-  target.classList.add('flash');
-}
-
-/* ===========================
-   7. DEVICE MODALS
-   =========================== */
-
-function kvHtml(pairs) {
-  return '<dl class="kv">' + pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
-}
-
-function openNodeModal(id) {
-  const m = el('modal');
-  const title = el('modal-title');
-  const body = el('modal-body');
-  let html = '';
-
-  if (isWifi() && id.startsWith('pc')) {
-    const p = PCS.find(x => x.id === id);
-    title.textContent = '💻 ' + p.name;
-    html = kvHtml([
-      ['Hostname', p.name],
-      ['IPv4', p.ip + '  (private — RFC 1918)'],
-      ['Subnet', p.subnet],
-      ['MAC', p.mac],
-      ['Gateway', p.gateway + '  (assigned via DHCP)'],
-      ['DNS', p.dns + '  (router acts as DNS proxy)'],
-      ['Connection', p.connection],
-      ['Status', p.id === 'pc' + sim.clientNum ? '⭐ selected — initiates the request' : 'online — shares the same router'],
-      ['Current connections', p.id === 'pc' + sim.clientNum && sim.nat.length ? `${p.ip}:${clientPort()} → ${GOOGLE_IP}:443 (TLS)` : '—']
-    ]);
-    html += '<p class="table-note">Private addresses like 192.168.x.x are not routed on the public Internet — that is why NAT exists.</p>';
-  } else if (id === 'router' && isWifi()) {
-    title.textContent = '📡 Wi-Fi Router';
-    html = kvHtml([
-      ['LAN interface', NET.router.lanIp + ' · MAC ' + NET.router.lanMac],
-      ['WAN interface', NET.router.wanIp + ' (simulated public IP) · MAC ' + NET.router.wanMac],
-      ['Default route', NET.router.ispGateway + ' (ISP)'],
-      ['NAT', 'enabled — maps private sockets to public ports'],
-      ['Also runs', 'DHCP server, DNS proxy']
-    ]);
-    html += '<h3>Routing table</h3>' + routingTableHtml('router');
-  } else if (id === 'isp') {
-    title.textContent = '🏢 ISP (simulated AS64500)';
-    html = kvHtml([
-      ['Role', 'Connects your home to the wider Internet'],
-      ['Internal structure', 'Access router → Aggregation router → Core router'],
-      ['BGP', 'Exchanges reachability with other autonomous systems']
-    ]);
-    html += '<p class="table-note">Your home router does NOT connect directly to Google. The ISP carries traffic from access, through aggregation, to its core and out to other networks.</p>';
-    html += '<h3>Routing table</h3>' + routingTableHtml('isp');
-  } else if (id.startsWith('r') && id.length === 2) {
-    const n = nodeById(id);
-    title.textContent = '🛣 ' + n.name + ' — Internet router (simulated)';
-    html = kvHtml([
-      ['Router ID', n.name.toUpperCase()],
-      ['AS', n.ip],
-      ['Destination of interest', GOOGLE_IP_LABEL],
-      ['Next hop', nextHopOf(id)]
-    ]);
-    html += '<p class="table-note">Part of the SIMULATED INTERNET PATH. Real routes are learned dynamically (BGP) and change over time.</p>';
-    html += '<h3>Routing table</h3>' + routingTableHtml(id);
-  } else if (id === 'edge') {
-    title.textContent = '🏢 Google Edge (simulated)';
-    html = kvHtml([
-      ['Destination', 'Google service entry point'],
-      ['Anycast', 'Possible — the same IP can be announced from many locations; routing steers you to a nearby one'],
-      ['Location', 'Simulated edge location'],
-      ['AS', 'AS15169 (shown for teaching — the displayed path is not real)']
-    ]);
-    html += '<p class="table-note">The simulator has NOT identified your real Google server. Large services run globally distributed infrastructure.</p>';
-  } else if (id === 'server') {
-    title.textContent = '🖥 Google Server (simulated)';
-    html = kvHtml([
-      ['Status', '🟢 online'],
-      ['Listening port', '443'],
-      ['Protocol', 'HTTPS (TLS 1.3 shown; real services may also use HTTP/3 over QUIC/UDP)'],
-      ['Address', GOOGLE_IP_LABEL],
-      ['Role', 'Terminates TLS, serves the application response']
-    ]);
-  } else if (id === 'client') {
-    title.textContent = '📱 Mobile client';
-    html = kvHtml([
-      ['Device IP', NET.mobile.deviceIp + '  (private — from the carrier)'],
-      ['Public IPv4', 'The device normally does NOT get one'],
-      ['Gateway', 'Mobile core (GGSN/PGW)'],
-      ['Link', 'Cellular radio — no Ethernet MAC, no ARP on this hop']
-    ]);
-    html += '<p class="table-note">Mobile networks commonly place subscribers behind carrier-grade NAT (CGNAT).</p>';
-  } else if (id === 'tower') {
-    title.textContent = '📡 Cell Tower';
-    html = kvHtml([['Role', 'Radio access between your device and the operator network'], ['Note', 'Radio hops are encrypted separately from TLS — two different layers.']]);
-  } else if (id === 'core') {
-    title.textContent = '🏢 Mobile Core';
-    html = kvHtml([['Role', 'Operator core network: authentication, mobility, session management'], ['Hands traffic to', 'CGNAT, then the public Internet']]);
-  } else if (id === 'cgnat') {
-    title.textContent = '🔀 Carrier-Grade NAT (CGNAT)';
-    html = kvHtml([
-      ['Subscriber side', '10.0.0.0/8 private space (simulated)'],
-      ['Shared space', '100.64.0.0/10 (RFC 6598)'],
-      ['Public pool', NET.mobile.publicIp + ' … (simulated)'],
-      ['Why', 'IPv4 exhaustion — many subscribers share few public addresses']
-    ]);
-    html += '<h3>Translation table</h3>' + routingTableHtml('cgnat');
-  } else {
-    title.textContent = id;
-    html = '<p>Simulated node.</p>';
+    return best;
   }
 
-  body.innerHTML = html;
-  m.hidden = false;
-  el('modal-close').focus();
-}
+  /* ------------------------------------------------------------------------
+   * 2. Engines — NAT, DNS, ARP, packet model
+   * ---------------------------------------------------------------------- */
+  let PKT_SEQ = 1;
 
-function routingTableHtml(key) {
-  const defs = isWifi() ? ROUTING_TABLES.wifi : ROUTING_TABLES.mobile;
-  const def = defs[key];
-  if (!def) return '<p class="table-note">(no table modeled for this node)</p>';
-  return '<table class="data-table"><thead><tr><th>Destination</th><th>Next hop</th><th>Interface</th></tr></thead><tbody>' +
-    def.rows.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('') +
-    '</tbody></table><p class="table-note">' + def.note + '</p>';
-}
-
-function nextHopOf(id) {
-  const order = isWifi() ? ['r1', 'r2', 'r3', 'r4', 'edge', 'server'] : ['r1', 'r2', 'edge', 'server'];
-  const i = order.indexOf(id);
-  const nxt = order[i + 1];
-  if (!nxt) return '—';
-  const names = { r1: 'R1', r2: 'R2', r3: 'R3', r4: 'R4', edge: 'Google Edge', server: 'Google Server' };
-  return names[nxt] || nxt;
-}
-
-/* ===========================
-   8. STAGE DEFINITIONS (data-driven)
-   =========================== */
-
-const OUT_PATH_WIFI = () => [client().id, 'router', 'isp', 'r1', 'r2', 'r3', 'r4', 'edge', 'server'];
-const IN_PATH_WIFI_TO_ROUTER = () => ['server', 'edge', 'r4', 'r3', 'r2', 'r1', 'isp', 'router'];
-const OUT_PATH_MOBILE = () => ['client', 'tower', 'core', 'cgnat', 'isp', 'r1', 'r2', 'edge', 'server'];
-const IN_PATH_MOBILE_TO_CGNAT = () => ['server', 'edge', 'r2', 'r1', 'isp', 'cgnat'];
-
-const outPath = () => isWifi() ? OUT_PATH_WIFI() : OUT_PATH_MOBILE();
-const inPathToNat = () => isWifi() ? IN_PATH_WIFI_TO_ROUTER() : IN_PATH_MOBILE_TO_CGNAT();
-
-// Packet templates ------------------------------------------------
-
-function dnsQueryPacket() {
-  return {
-    l7: [['Protocol', 'DNS query'], ['Name', sim.domain], ['Type', 'A (IPv4 address)'], ['Recursion', 'desired']],
-    l4: [['Protocol', 'UDP'], ['Source port', '53210'], ['Destination port', '53']],
-    l3: [['Source IP', clientIp()], ['Destination IP', isWifi() ? NET.gateway : 'carrier resolver (simulated)'], ['TTL', '64']],
-    l2: isWifi() ? [['Source MAC', client().mac], ['Destination MAC', NET.router.lanMac]] : [['Link', 'cellular — no MAC/ARP']]
-  };
-}
-function dnsResponsePacket() {
-  return {
-    l7: [['Protocol', 'DNS response'], ['Answer', sim.domain + ' → ' + GOOGLE_IP + ' (SIMULATED)'], ['TTL', '300s']],
-    l4: [['Protocol', 'UDP'], ['Source port', '53'], ['Destination port', '53210']],
-    l3: [['Source IP', isWifi() ? NET.gateway : 'carrier resolver'], ['Destination IP', clientIp()], ['TTL', '64']],
-    l2: isWifi() ? [['Source MAC', NET.router.lanMac], ['Destination MAC', client().mac]] : [['Link', 'cellular']]
-  };
-}
-function tcpPacket(kind) {
-  const out = kind === 'SYN' || kind === 'ACK' || kind === 'DATA-REQ';
-  const flags = { SYN: 'SYN seq=1000', 'SYN-ACK': 'SYN+ACK seq=5000 ack=1001', ACK: 'ACK ack=5001', 'DATA-REQ': 'PSH+ACK (carrying TLS)' }[kind] || 'ACK';
-  return {
-    l7: [['Application', 'TLS / HTTPS goes here (not established yet)']],
-    l4: [['Protocol', 'TCP'], [out ? 'Source port' : 'Source port', String(out ? clientPort() : 443)], ['Destination port', String(out ? 443 : publicPort() + ' → ' + clientPort())], ['Flags', flags]],
-    l3: out
-      ? [['Source IP', clientIp() + ' → NAT → ' + publicIp()], ['Destination IP', GOOGLE_IP + ' (simulated)'], ['TTL', '64, decremented each router hop']]
-      : [['Source IP', GOOGLE_IP + ' (simulated)'], ['Destination IP', publicIp() + ' → NAT → ' + clientIp()], ['TTL', '≈55 on arrival (simulated)']],
-    l2: isWifi()
-      ? [['First hop MACs', out ? client().mac + ' → ' + NET.router.lanMac : NET.router.lanMac + ' → ' + client().mac], ['Note', 'MACs are rewritten at every routed hop']]
-      : [['Link', 'cellular (first hop), then Ethernet-like links at each routed hop']]
-  };
-}
-function tlsPacket(phase) {
-  const base = tcpPacket('DATA-REQ');
-  if (phase === 'clienthello') {
-    base.l7 = [['TLS record', 'ClientHello'], ['Version offered', 'TLS 1.3'], ['SNI', sim.domain + ' (visible — hostname is not encrypted in classic TLS)'], ['Key share', 'simulated x25519 public value']];
-  } else if (phase === 'serverhello') {
-    base.l7 = [['TLS record', 'ServerHello + Certificate'], ['Chosen cipher', 'TLS_AES_256_GCM_SHA384 (TLS 1.3)'], ['Certificate', 'CN=' + sim.domain + ' (simulated)'], ['Key share', 'simulated server public value']];
-  } else {
-    base.l7 = [['TLS record', 'Handshake finished'], ['Result', 'Symmetric session keys derived — channel encrypted'], ['Keys', 'never shown — simulated values only']];
-  }
-  return base;
-}
-function httpsReqPacket() {
-  return {
-    l7: [['SIMULATED HTTPS REQUEST', 'GET /  Host: ' + sim.domain], ['On the wire', '████████████████████ (encrypted application data)'], ['Visible to observers', 'IPs, ports, timing, sizes — NOT the content']],
-    l4: [['Protocol', 'TCP'], ['Source port', String(clientPort())], ['Destination port', '443']],
-    l3: [['Source IP', clientIp() + ' → NAT → ' + publicIp()], ['Destination IP', GOOGLE_IP + ' (simulated)'], ['TTL', '64 at source']],
-    l2: isWifi() ? [['Source MAC', client().mac], ['Destination MAC', NET.router.lanMac]] : [['Link', 'cellular first hop']]
-  };
-}
-function httpsRespPacket() {
-  return {
-    l7: [['SIMULATED HTTPS RESPONSE', 'HTTP 200 OK'], ['Content', 'HTML + CSS + JavaScript + images (encrypted on the wire)'], ['Length', '≈18 KB simulated']],
-    l4: [['Protocol', 'TCP'], ['Source port', '443'], ['Destination port', publicPort() + ' — rewritten by NAT to ' + clientPort()]],
-    l3: [['Source IP', GOOGLE_IP + ' (simulated)'], ['Destination IP', publicIp() + ' → NAT → ' + clientIp()], ['TTL', '≈55 on arrival (simulated)']],
-    l2: isWifi() ? [['Final hop MACs', NET.router.lanMac + ' → ' + client().mac]] : [['Final hop', 'CGNAT → mobile core → tower → your device']]
-  };
-}
-
-// NAT translation label change at the NAT node when animating
-const natNodeId = () => isWifi() ? 'router' : 'cgnat';
-const natOutChange = () => ({ [natNodeId()]: `→ ${publicIp()}:${publicPort()}` });
-const natInChange = () => ({ [natNodeId()]: `→ ${clientIp()}:${clientPort()}` });
-
-// Hop-by-hop teaching logs on the FIRST full outbound traversal
-function firstOutHopLogs() {
-  const m = {};
-  m[natNodeId()] = `NAT: ${clientIp()}:${clientPort()} rewritten to ${publicIp()}:${publicPort()} (simulated translation)`;
-  m.isp = 'ISP: access network → aggregation → ISP core (packet leaves your neighborhood)';
-  m[isWifi() ? 'r1' : 'r1'] = 'R1 (transit, simulated): forwarding toward 142.250.x.x — TTL decremented';
-  if (isWifi()) m.r2 = 'R2: forwarding — next hop R3';
-  m.r3 = 'R3: forwarding — next hop R4';
-  m.r4 = 'R4: handing traffic to Google edge via a BGP-learned route (simulated)';
-  if (!isWifi()) m.r2 = 'R2: handing traffic to Google edge via a BGP-learned route (simulated)';
-  m.edge = 'Google Edge (AS15169, simulated): anycast-style entry point accepts the connection';
-  if (isWifi()) { m.tower = undefined; }
-  return m;
-}
-
-/* ----- Stage list ----- */
-
-function buildStages() {
-  const S = [];
-  const dirBadge = { req: '➜ REQUEST · client → server', res: '⬅ RESPONSE · server → client', local: 'LOCAL · no packet on the wire' };
-
-  // --- setup ---
-  S.push({
-    id: 'setup',
-    title: isWifi() ? 'Network setup — DHCP gave your PC an address' : 'Network attach — the carrier gave your device an address',
-    proto: isWifi() ? 'DHCP (UDP 67/68)' : 'Mobile attach',
-    dir: 'local',
-    explain: {
-      beginner: isWifi()
-        ? `Before anything else, ${clientLabel()} asked the router for network settings (DHCP) and received its IP address, gateway and DNS server.`
-        : 'Your phone attached to the mobile network and received an IP address from the carrier — usually a private address, not a public one.',
-      intermediate: isWifi()
-        ? `${clientLabel()} completed DHCP Discover/Offer/Request/Ack with ${NET.gateway} and now holds ${clientIp()} in ${NET.lan}, gateway ${NET.gateway}, DNS ${NET.gateway}.`
-        : `The attach procedure established a data session; the device received ${NET.mobile.deviceIp} (private). Carriers commonly sit subscribers behind CGNAT.`,
-      technical: isWifi()
-        ? `DHCP lease (simulated): yiaddr ${clientIp()}/24, router ${NET.gateway}, DNS ${NET.gateway}. The address space 192.168.0.0/16 is RFC 1918 private and is dropped by public routers.`
-        : `Session established via the packet core (GGSN/PGW or 5G UPF analogue). Subscriber address ${NET.mobile.deviceIp} is RFC 1918; NAT44 at the carrier edge (CGNAT) provides public reachability.`
-    },
-    learn: {
-      what: isWifi() ? `${clientLabel()} got IP ${clientIp()}, gateway and DNS from the router.` : `The device got ${NET.mobile.deviceIp} from the carrier.`,
-      why: 'A device needs an address, a default gateway and a resolver before it can use IP at all.',
-      proto: isWifi() ? 'DHCP over UDP (ports 67/68)' : 'Mobile network attach / session setup',
-      visible: isWifi() ? 'Broadcast DHCP traffic on the local Wi-Fi only.' : 'Signaling between device, tower and mobile core.',
-      changes: 'The client becomes addressable on its local network.'
-    },
-    onEnter() {
-      hidePacket();
-      renderEncap('req');
-      log(isWifi() ? `DHCP: ${clientLabel()} leased ${clientIp()} (gateway ${NET.gateway}, DNS ${NET.gateway})` : `Mobile: device attached, assigned ${NET.mobile.deviceIp} (private, carrier NAT)`);
-      highlightNodes([isWifi() ? client().id : 'client', isWifi() ? 'router' : 'core']);
+  function macFor(nodeId, towardId, net) {
+    const n = net.nodes[nodeId];
+    if (!n) return '—';
+    if (n.macs) {
+      // Router-like device: pick LAN-side mac if the next node is on the LAN side, else WAN-side.
+      const boundaryIdx = net.spineIndex[net.natBoundaryAfter];
+      const towardIdx = net.spineIndex[towardId];
+      const selfIdx = net.spineIndex[nodeId];
+      if (towardIdx !== undefined && towardIdx < selfIdx) return n.macs.lan || n.mac;
+      return boundaryIdx !== undefined && selfIdx <= boundaryIdx ? (n.macs.wan || n.mac) : (n.macs.lan || n.mac);
     }
-  });
-
-  // --- URL ---
-  S.push({
-    id: 'url',
-    title: 'You type ' + sim.domain,
-    proto: 'Browser',
-    dir: 'local',
-    explain: {
-      beginner: `You typed "${sim.domain}" and pressed GO. The browser understands names — but the network only understands IP addresses.`,
-      intermediate: `The browser parses the URL: scheme=https, host=${sim.domain}, port=443 (default for HTTPS). It now needs an IP address for ${sim.domain}.`,
-      technical: `URL parse: https://${sim.domain}/ → host "${sim.domain}", implicit port 443. The stub resolver will be queried because hosts file / caches are checked first (next step).`
-    },
-    learn: {
-      what: `The browser received a domain name: ${sim.domain}.`,
-      why: 'Humans use names; IP packets only carry numeric addresses.',
-      proto: '(browser URL parsing — no network traffic yet)',
-      visible: 'Nothing on the wire yet.',
-      changes: `The browser knows it must connect to ${sim.domain}:443 over HTTPS.`
-    },
-    onEnter() {
-      hidePacket();
-      el('browser-url').textContent = 'https://' + sim.domain;
-      log(`Browser: ${sim.domain} entered`);
-      highlightNodes([isWifi() ? client().id : 'client']);
-    }
-  });
-
-  // --- DNS cache ---
-  S.push({
-    id: 'dns-cache',
-    title: 'Check local DNS cache first',
-    proto: 'DNS cache',
-    dir: 'local',
-    explain: {
-      beginner: 'The browser asks: have I looked this up recently? If a cached answer is still valid (TTL), no network traffic is needed at all.',
-      intermediate: 'The browser/OS check their resolver caches. On a cold start the entry is missing (or expired), so a real DNS query is required.',
-      technical: 'Stub resolver checks browser cache → OS cache → hosts file. Miss → build a recursive query for an A record toward the configured resolver.'
-    },
-    learn: {
-      what: 'Cache checked — no valid entry for ' + sim.domain + '.',
-      why: 'Caching avoids repeating lookups; TTL controls how long an answer may be reused.',
-      proto: 'DNS (cache lookup — local only)',
-      visible: 'Nothing on the wire.',
-      changes: 'Decision: send a DNS query.'
-    },
-    onEnter() {
-      hidePacket();
-      log('DNS: cache miss for ' + sim.domain + ' — query required');
-      renderDns();
-      highlightNodes([isWifi() ? client().id : 'client']);
-    }
-  });
-
-  // --- DNS query ---
-  S.push({
-    id: 'dns-query',
-    title: 'DNS query goes out',
-    proto: 'DNS · UDP · port 53',
-    dir: 'req',
-    packet: dnsQueryPacket,
-    lifecycle: 2,
-    animate: () => ({
-      path: isWifi() ? [client().id, 'router'] : ['client', 'tower', 'core'],
-      label: `DNS? ${sim.domain}`, dir: 'req', perHop: 420
-    }),
-    explain: {
-      beginner: `${clientLabel()} asks the DNS resolver: "what is the IP address of ${sim.domain}?"`,
-      intermediate: `A DNS query (type A) for ${sim.domain} is sent over UDP to the resolver at ${isWifi() ? NET.gateway + ' — your router proxies it to the ISP resolver' : 'the carrier resolver'} on port 53. The resolver does the recursive work.`,
-      technical: `Query ${sim.domain} IN A + RD flag via UDP/53 (encrypted DNS transports such as DoH/DoT also exist but are not modeled). The recursive resolver would walk root → .com TLD → authoritative servers on a miss; the simulation collapses this recursion into one reply.`
-    },
-    learn: {
-      what: `${clientLabel()} sent a DNS query for ${sim.domain}.`,
-      why: 'The browser needs an IP address before any connection can be opened.',
-      proto: 'DNS', 
-      visible: 'The query name is visible on the wire in classic DNS (unless DoH/DoT is used).',
-      changes: 'Resolver starts resolving.'
-    },
-    onEnter() {
-      log('DNS: query created — ' + sim.domain + ' (type A, UDP, dst port 53)');
-      highlightNodes(isWifi() ? [client().id, 'router'] : ['client', 'tower', 'core']);
-    }
-  });
-
-  // --- DNS response ---
-  S.push({
-    id: 'dns-response',
-    title: 'DNS response — ' + GOOGLE_IP_LABEL,
-    proto: 'DNS · UDP · port 53',
-    dir: 'res',
-    packet: dnsResponsePacket,
-    lifecycle: 7,
-    animate: () => ({
-      path: isWifi() ? ['router', client().id] : ['core', 'tower', 'client'],
-      label: `DNS → ${GOOGLE_IP}`, dir: 'res', perHop: 420
-    }),
-    explain: {
-      beginner: `The resolver answers: ${sim.domain} is at ${GOOGLE_IP}. This address is SIMULATED — real answers change all the time and there are usually several.`,
-      intermediate: `Response: ${sim.domain} A ${GOOGLE_IP} (SIMULATED), TTL 300s. The client caches it. Real resolvers return multiple rotating addresses.`,
-      technical: 'Answer section carries the A record(s) with TTL. Stub caches until expiry. Real-world: anycasted/rotated pools, geo-aware answers — none of that is modeled here; 142.250.x.x is illustrative.'
-    },
-    learn: {
-      what: `Received ${GOOGLE_IP} (simulated).`,
-      why: 'DNS translates domain names into IP addresses.',
-      proto: 'DNS',
-      visible: 'Answer visible in classic DNS; TTL tells the client how long it may cache it.',
-      changes: 'DNS cache populated; the browser can now open a connection.'
-    },
-    onEnter() {
-      sim.dns[sim.domain] = { type: 'A', value: GOOGLE_IP, ttl: 300 };
-      renderDns();
-      log(`DNS: response received — ${sim.domain} → ${GOOGLE_IP} (simulated, TTL 300s)`, 'ok');
-      highlightNodes([isWifi() ? client().id : 'client']);
-    }
-  });
-
-  // --- ARP (Wi-Fi only) ---
-  if (isWifi()) {
-    S.push({
-      id: 'arp-req',
-      title: 'ARP — who has the gateway?',
-      proto: 'ARP (link-local)',
-      dir: 'req',
-      lifecycle: 2,
-      animate: () => ({
-        path: [client().id, 'router'],
-        label: `ARP: who has ${NET.gateway}?`, dir: 'req', perHop: 520,
-        dropAt: null
-      }),
-      explain: {
-        beginner: `To hand the packet to the router, ${clientLabel()} needs the router's MAC address. It shouts on the local Wi-Fi: "Who has ${NET.gateway}?"`,
-        intermediate: `${clientLabel()} broadcasts an ARP request for ${NET.gateway}. Every device on the LAN hears it; only the owner replies. ARP exists ONLY on the local link — it never crosses the Internet.`,
-        technical: 'ARP request is an L2 broadcast (ff:ff:ff:ff:ff:ff) asking for the MAC of the gateway IPv4. Target Protocol Address = 192.168.1.1. Responses may be unicast.'
-      },
-      learn: {
-        what: 'ARP request broadcast for ' + NET.gateway + '.',
-        why: 'IP gets the packet to the local network; the link layer needs a MAC address to deliver the frame.',
-        proto: 'ARP',
-        visible: 'Broadcast — all five PCs see it.',
-        changes: 'None yet — waiting for a reply.'
-      },
-      onEnter() {
-        log(`ARP: ${clientLabel()} asks "who has ${NET.gateway}?" (broadcast)`);
-        highlightNodes([client().id, 'router']);
-      }
-    });
-    S.push({
-      id: 'arp-resp',
-      title: 'ARP reply — gateway MAC learned',
-      proto: 'ARP (link-local)',
-      dir: 'res',
-      lifecycle: 7,
-      animate: () => ({
-        path: ['router', client().id],
-        label: `ARP: ${NET.gateway} is ${NET.router.lanMac}`, dir: 'res', perHop: 520
-      }),
-      explain: {
-        beginner: `The router answers: "${NET.gateway} is at ${NET.router.lanMac}". ${clientLabel()} stores this in its ARP cache.`,
-        intermediate: `Router replies (usually unicast): ${NET.gateway} → ${NET.router.lanMac}. The entry is cached so ARP is not repeated for every packet.`,
-        technical: 'ARP reply populates the neighbor cache entry (IP→MAC), typically with a timeout. Gratuitous ARP and cache poisoning exist — that is why ARP spoofing is a classic LAN attack.'
-      },
-      learn: {
-        what: 'Learned gateway MAC ' + NET.router.lanMac + '.',
-        why: 'Frames to the gateway can now be addressed at layer 2.',
-        proto: 'ARP',
-        visible: 'Reply on the local link only.',
-        changes: 'ARP cache populated: ' + NET.gateway + ' → ' + NET.router.lanMac + '.'
-      },
-      onEnter() {
-        sim.arp[NET.gateway] = NET.router.lanMac;
-        renderArp();
-        log(`ARP: gateway MAC resolved — ${NET.gateway} is ${NET.router.lanMac}`, 'ok');
-        highlightNodes([client().id]);
-      }
-    });
+    return n.mac || '—';
   }
 
-  // --- BGP / routing overview ---
-  S.push({
-    id: 'bgp',
-    title: 'How the Internet finds Google — routing & BGP',
-    proto: 'IP routing + BGP',
-    dir: 'local',
-    explain: {
-      beginner: 'Between you and Google sit many networks. Each router only knows the NEXT hop, agreed via routing protocols. The chain shown here is SIMULATED — real paths are dynamic.',
-      intermediate: 'Routers forward hop-by-hop using longest-prefix match on the destination IP. Between organisations, BGP advertises which IP ranges each Autonomous System (AS) can reach. Shown: AS64500 (ISP) → AS64501 (transit) → AS15169 (Google) — simulated teaching path.',
-      technical: 'BGP exchanges reachability (prefixes + AS_PATH) between ASes; it does not pin individual packets to a route. Within each AS, an IGP + forwarding tables pick next hops. The displayed AS numbers/routers are illustrative, not live BGP data.'
-    },
-    learn: {
-      what: 'Forwarding plan: longest-prefix match hop-by-hop; BGP glues the ASes together.',
-      why: 'No single device knows the whole Internet — reachability is distributed knowledge.',
-      proto: 'BGP between ASes; longest-prefix routing inside routers',
-      visible: 'Packets do not carry their route. Each router decides locally.',
-      changes: 'Nothing on the wire — this is the map the next packets will ride on.'
-    },
-    onEnter() {
-      hidePacket('Routing overview stage — no packet moving.');
-      log('BGP (overview): AS path 64500 → 64501 → 15169 (SIMULATED — not a live route)');
-      highlightNodes(isWifi() ? ['isp', 'r2', 'edge'] : ['isp', 'r1', 'edge']);
-      switchTabSilentlyHint();
-    }
-  });
+  function isBeforeNat(nodeId, net) {
+    const b = net.spineIndex[net.natBoundaryAfter];
+    const i = net.spineIndex[nodeId];
+    if (b === undefined || i === undefined) return true;
+    return i < b;
+  }
 
-  // --- TCP handshake ---
-  S.push({
-    id: 'tcp-syn',
-    title: 'TCP handshake 1/3 — SYN',
-    proto: 'TCP · port 443',
-    dir: 'req',
-    packet: () => tcpPacket('SYN'),
-    lifecycle: 4,
-    animate: () => ({
-      path: outPath(), label: 'SYN ' + clientPort() + '→443', dir: 'req', perHop: 420,
-      changes: natOutChange(), hopLogs: firstOutHopLogs()
-    }),
-    explain: {
-      beginner: `${clientLabel()} says hello: "I want to talk (SYN), on port 443 — the HTTPS port." On the way out, your ${natDeviceName()} rewrites the source address (NAT).`,
-      intermediate: `SYN with source port ${clientPort()} (ephemeral) → destination 443. At the ${natDeviceName()}, ${clientIp()}:${clientPort()} becomes ${publicIp()}:${publicPort()} and the mapping is stored. TTL decrements at every router.`,
-      technical: `TCP SYN (seq 1000, simulated), ephemeral/${clientPort()} → https/443. NAT44 translates the tuple and records (${clientIp()}:${clientPort()} ↔ ${publicIp()}:${publicPort()}, dst ${GOOGLE_IP}:443). MAC headers are rebuilt per hop; IP addresses are end-to-end (until NAT).`
-    },
-    learn: {
-      what: 'SYN sent; NAT entry created.',
-      why: 'TCP needs a three-way handshake before data can flow. NAT lets many devices share one public IPv4.',
-      proto: 'TCP handshake + NAT44',
-      visible: 'IPs/ports visible in clear; private addresses never leave your network.',
-      changes: `NAT table gains ${clientIp()}:${clientPort()} → ${publicIp()}:${publicPort()}.`
-    },
-    onEnter() {
-      // Simulated NAT translation. This is not a real network connection.
-      sim.nat = [];
-      if (sim.multi && isWifi()) {
-        PCS.forEach((p, i) => {
-          sim.nat.push({ internalIp: p.ip, internalPort: 50001 + i, publicIp: publicIp(), publicPort: 40001 + i, dest: GOOGLE_IP + ':443', current: i === sim.clientNum - 1 });
-        });
-        log('NAT: 5 PCs share one public IP — router tells them apart by public port (40001–40005)');
+  /** NAT engine: a shared translation table for however many "computers" are active at once. */
+  function makeNatEngine() {
+    let nextPort = 40000;
+    const table = [];
+    return {
+      table,
+      allocate(pcId, pcName, internalIp, remoteIp, remotePort, proto) {
+        let entry = table.find((e) => e.pcId === pcId && e.remoteIp === remoteIp && e.remotePort === remotePort && e.proto === proto && e.state !== 'closed');
+        if (entry) return entry;
+        entry = {
+          pcId, pcName, internalIp, internalPort: 51820 + (table.length % 500), publicPort: nextPort++,
+          remoteIp, remotePort, proto, state: 'ESTABLISHING', created: Date.now()
+        };
+        table.push(entry);
+        return entry;
+      },
+      lookupByPublicPort(port) { return table.find((e) => e.publicPort === port); },
+      setState(entry, s) { if (entry) entry.state = s; },
+      remove(pcId) { for (let i = table.length - 1; i >= 0; i--) if (table[i].pcId === pcId) table.splice(i, 1); },
+      clear() { table.length = 0; nextPort = 40000; }
+    };
+  }
+
+  /** DNS engine: a small resolver cache, keyed by "name|type". */
+  function makeDnsEngine() {
+    const cache = new Map();
+    return {
+      cache,
+      lookup(name, type) { return cache.get(name + '|' + type) || null; },
+      store(name, type, value, ttl) { cache.set(name + '|' + type, { name, type, value, ttl, stored: Date.now() }); },
+      flush() { cache.clear(); },
+      rows() { return Array.from(cache.values()); }
+    };
+  }
+
+  /** ARP engine: one cache per LAN segment (Wi-Fi only — mobile has no ARP). */
+  function makeArpEngine() {
+    const cache = new Map();          // ip -> mac
+    const switchTable = new Map();    // mac -> port/node id
+    return {
+      cache, switchTable,
+      resolve(ip) { return cache.get(ip) || null; },
+      store(ip, mac) { cache.set(ip, mac); },
+      learn(mac, port) { switchTable.set(mac, port); },
+      flush() { cache.clear(); },
+      flushSwitch() { switchTable.clear(); }
+    };
+  }
+
+  /**
+   * A simulated packet. `srcIp`/`dstIp`/`srcPort`/`dstPort` are the *end to end* (application-level)
+   * addresses; per-hop Ethernet/IP/port values are computed on demand (see fieldsAtHop) so that NAT
+   * translation and per-hop MAC changes are calculated, not hand-scripted.
+   */
+  function mkPacket(state, o) {
+    const p = Object.assign({
+      id: 'pkt-' + (PKT_SEQ++), dir: 'request', kind: 'data', proto: 'IP', transport: 'TCP',
+      srcPort: null, dstPort: null, ttlStart: 64, payload: '', natEntry: null, path: [], stageId: null,
+      dropped: false
+    }, o);
+    state.packets.push(p);
+    return p;
+  }
+
+  function fieldsAtHop(state, pkt, aId, bId) {
+    const net = state.net;
+    const idxA = net.spineIndex[aId], idxB = net.spineIndex[bId];
+    const forward = idxA <= idxB;
+    const fromId = forward ? aId : bId, toId = forward ? bId : aId;
+    const srcMac = macFor(fromId, toId, net);
+    const dstMac = macFor(toId, fromId, net);
+    let srcIp = pkt.srcIp, dstIp = pkt.dstIp, srcPort = pkt.srcPort, dstPort = pkt.dstPort;
+    const ne = pkt.natEntry;
+    if (ne) {
+      if (pkt.dir === 'request') {
+        if (!isBeforeNat(fromId, net)) { srcIp = ne.publicIp; srcPort = ne.publicPort; }
       } else {
-        sim.nat.push({ internalIp: clientIp(), internalPort: clientPort(), publicIp: publicIp(), publicPort: publicPort(), dest: GOOGLE_IP + ':443', current: true });
+        if (!isBeforeNat(toId, net)) { dstIp = ne.publicIp; dstPort = ne.publicPort; }
       }
-      renderNat();
-      el('cmp-nat').hidden = true;
-      log(`TCP: SYN sent from ${clientLabel()} (${clientIp()}:${clientPort()})`);
     }
-  });
+    const hopsFromClient = Math.abs(net.spineIndex[aId] - net.spineIndex[net.roles.client]);
+    const ttl = Math.max(1, pkt.ttlStart - hopsFromClient);
+    return { srcMac, dstMac, srcIp, dstIp, srcPort, dstPort, ttl, forward };
+  }
 
-  S.push({
-    id: 'tcp-synack',
-    title: 'TCP handshake 2/3 — SYN-ACK comes back',
-    proto: 'TCP · port 443',
-    dir: 'res',
-    packet: () => tcpPacket('SYN-ACK'),
-    lifecycle: 6,
-    animate: () => ({
-      path: [...outPath()].reverse(), label: 'SYN-ACK 443→' + publicPort(), dir: 'res', perHop: 200,
-      changes: natInChange()
-    }),
-    explain: {
-      beginner: `The server answers: "OK, I hear you (SYN-ACK)!" Watch the direction flip — this is the RESPONSE travelling home.`,
-      intermediate: `The reply is addressed to ${publicIp()}:${publicPort()}. When it reaches the ${natDeviceName()}, the NAT mapping converts it back to ${clientIp()}:${clientPort()} — that is how it reaches ${clientLabel()} and not a neighbor.`,
-      technical: 'SYN-ACK dst = the NAT public tuple. Stateful NAT reverse-translates via the stored mapping and forwards to the internal socket. This demultiplexing by port is the core of the return path.'
-    },
-    learn: {
-      what: 'SYN-ACK received after travelling the whole path back.',
-      why: 'The server acknowledges your SYN and sends its own sequence number.',
-      proto: 'TCP handshake',
-      visible: 'Reverse NAT at the edge of your network rebuilt the destination as ' + clientIp() + ':' + clientPort() + '.',
-      changes: 'Connection half-open on both sides.'
-    },
-    onEnter() { log('TCP: SYN-ACK received' + (isWifi() ? ' (NAT mapped it back to ' + clientLabel() + ')' : ' (CGNAT mapped it back to your device)'), 'ok'); highlightNodes([isWifi() ? client().id : 'client']); }
-  });
+  function localMac(state, id) { return macFor(id, id, state.net); }
 
-  S.push({
-    id: 'tcp-ack',
-    title: 'TCP handshake 3/3 — ACK',
-    proto: 'TCP · port 443',
-    dir: 'req',
-    packet: () => tcpPacket('ACK'),
-    lifecycle: 4,
-    animate: () => ({ path: outPath(), label: 'ACK', dir: 'req', perHop: 200, changes: natOutChange() }),
-    explain: {
-      beginner: `${clientLabel()} answers: "Got it (ACK)!" The TCP connection is now open.`,
-      intermediate: 'The ACK completes the three-way handshake. Both sides now have synchronized sequence numbers and the connection is ESTABLISHED.',
-      technical: 'ACK(ack=5001) — connection enters ESTABLISHED state. One round trip spent; no data yet. (TCP Fast Open / 0-RTT alternatives exist but are not modeled.)'
-    },
-    learn: {
-      what: 'ACK sent — connection ESTABLISHED.',
-      why: 'Both sides must confirm they can send and receive.',
-      proto: 'TCP handshake',
-      visible: 'Still just headers — no application data.',
-      changes: 'Reliable byte stream ready for TLS.'
-    },
-    onEnter() { log('TCP: ACK sent — connection established', 'ok'); highlightNodes([isWifi() ? client().id : 'client', 'server']); }
-  });
+  /* ------------------------------------------------------------------------
+   * 3. Animator — moves a packet dot along the topology SVG
+   * ---------------------------------------------------------------------- */
+  function pathPoints(net, ids) { return ids.map((id) => net.layout[id]); }
 
-  // --- TLS ---
-  S.push({
-    id: 'tls-clienthello',
-    title: 'TLS handshake — ClientHello',
-    proto: 'TLS 1.3',
-    dir: 'req',
-    packet: () => tlsPacket('clienthello'),
-    lifecycle: 4,
-    animate: () => ({ path: outPath(), label: 'TLS ClientHello', dir: 'req', perHop: 200, changes: natOutChange() }),
-    explain: {
-      beginner: `${clientLabel()} proposes encryption settings: "I speak TLS 1.3; here are my options."`,
-      intermediate: `ClientHello offers TLS 1.3 parameters, ciphers and a key share, and carries SNI=${sim.domain} — the hostname, which observers can still see.`,
-      technical: 'TLS 1.3 ClientHello: supported_versions, cipher_suites, key_share (simulated x25519), SNI extension in cleartext unless ECH is deployed (not modeled). Session keys are NOT transmitted — they are derived later.'
-    },
-    learn: {
-      what: 'ClientHello sent inside the TCP connection.',
-      why: 'Both sides must agree on encryption before any web data flows.',
-      proto: 'TLS 1.3 handshake',
-      visible: 'SNI hostname and client parameters (visible); no keys yet.',
-      changes: 'Server can now pick parameters and prove its identity.'
-    },
-    onEnter() { log('TLS: ClientHello sent (SNI=' + sim.domain + ')'); highlightNodes([isWifi() ? client().id : 'client', 'server']); }
-  });
-
-  S.push({
-    id: 'tls-serverhello',
-    title: 'TLS handshake — ServerHello + certificate',
-    proto: 'TLS 1.3',
-    dir: 'res',
-    packet: () => tlsPacket('serverhello'),
-    lifecycle: 6,
-    animate: () => ({ path: [...outPath()].reverse(), label: 'TLS ServerHello + Cert', dir: 'res', perHop: 200, changes: natInChange() }),
-    explain: {
-      beginner: `The server replies: "Let's use these settings" and shows its certificate — its ID card proving it really is ${sim.domain}. The browser checks it.`,
-      intermediate: `ServerHello picks TLS_AES_256_GCM_SHA384 and returns a certificate chain for ${sim.domain} (simulated). The browser validates signatures, hostname match and expiry against trusted CAs.`,
-      technical: 'Server sends ServerHello, encrypted extensions, certificate + CertificateVerify (proof of the private key). Both sides derive shared secrets from the ephemeral key shares. Simulated values only — no real keys are generated.'
-    },
-    learn: {
-      what: 'ServerHello + certificate received and validated.',
-      why: 'Encryption without identity would be useless — the certificate binds the keys to ' + sim.domain + '.',
-      proto: 'TLS 1.3 handshake + X.509 certificate validation',
-      visible: 'The certificate itself (it is public information); key shares are public components, not secrets.',
-      changes: 'Session keys derived — an encrypted channel exists.'
-    },
-    onEnter() { log('TLS: ServerHello + certificate received and validated (simulated)', 'ok'); highlightNodes([isWifi() ? client().id : 'client', 'server']); }
-  });
-
-  S.push({
-    id: 'tls-established',
-    title: 'Encrypted channel established 🔐',
-    proto: 'TLS 1.3 · HTTPS ready',
-    dir: 'local',
-    packet: () => tlsPacket('established'),
-    lifecycle: 7,
-    explain: {
-      beginner: 'From now on, everything inside the connection is encrypted. Observers can see WHO you talk to and roughly how much data — but not the content.',
-      intermediate: 'Handshake finished messages confirm both sides derived identical session keys. The padlock in the address bar now reflects an authenticated, encrypted channel.',
-      technical: 'AEAD (AES-256-GCM here, simulated) protects records with confidentiality + integrity. Metadata still leaks: destination IP, SNI (classically), traffic volume and timing.'
-    },
-    learn: {
-      what: 'TLS setup finished — the channel is encrypted.',
-      why: 'So nobody between you and the server can read or modify the page.',
-      proto: 'TLS 1.3 record protection',
-      visible: 'Encrypted records only. Metadata (IPs, sizes, timing) remains.',
-      changes: 'The browser can finally send the actual web request.'
-    },
-    onEnter() {
-      hidePacket('Local stage — keys derived on both ends.');
-      el('browser-bar').classList.add('secure');
-      log('TLS: handshake completed — encrypted channel up 🔐', 'ok');
-      renderEncap('req');
-      highlightNodes([isWifi() ? client().id : 'client', 'server']);
+  function animateAlong(state, ids, dir, totalMs, onDone) {
+    const svg = $('#topo-svg');
+    let dot = $('#pkt-dot', svg);
+    if (!dot) {
+      dot = svgEl('circle', { id: 'pkt-dot', r: 7, class: 'pkt-dot ' + dir });
+      svg.appendChild(dot);
+    } else {
+      dot.setAttribute('class', 'pkt-dot ' + dir);
     }
-  });
-
-  // --- HTTPS request ---
-  S.push({
-    id: 'https-request',
-    title: 'HTTPS request — GET / (encrypted)',
-    proto: 'HTTPS over TLS',
-    dir: 'req',
-    packet: httpsReqPacket,
-    lifecycle: 4,
-    animate: () => ({ path: outPath(), label: 'GET / 🔒', dir: 'req', perHop: 200, changes: natOutChange() }),
-    explain: {
-      beginner: 'The browser finally asks for the page: "GET /". On the wire it is just encrypted noise — even routers that carry it cannot read it.',
-      intermediate: 'Request line + headers (Host: ' + sim.domain + ') travel as TLS application data. Wasmé: routers forward the ciphertext; only the two endpoints hold the keys.',
-      technical: 'SIMULATED HTTPS REQUEST: GET / HTTP/2-style, protected as TLS application_data records. Middleboxes see TCP/IP headers and record sizes only.'
-    },
-    learn: {
-      what: 'Encrypted GET / request sent to the server.',
-      why: 'This is the actual "give me the page" message.',
-      proto: 'HTTPS (HTTP inside TLS inside TCP)',
-      visible: 'Ciphertext + metadata. Not the URL path, not headers.',
-      changes: 'The server can now build the response.'
-    },
-    onEnter() { log('HTTPS: GET / sent (encrypted, simulated request)'); highlightNodes([isWifi() ? client().id : 'client', 'server']); renderEncap('req'); }
-  });
-
-  // --- Server processing ---
-  S.push({
-    id: 'server-processing',
-    title: 'Google builds the response',
-    proto: 'Server side',
-    dir: 'local',
-    packet: httpsRespPacket,
-    lifecycle: 0,
-    explain: {
-      beginner: 'The server decrypts your request, finds the page, and prepares the answer: 200 OK with HTML, CSS, JavaScript and images.',
-      intermediate: 'The front end terminates TLS, the service generates the response (200 OK + content), and the whole thing is encrypted back toward your connection tuple.',
-      technical: 'SIMULATED. Real Google serving involves负载 balancers, edge caches and many internal RPCs. Here: one server object replies 200 OK.'
-    },
-    learn: {
-      what: 'Response generated: HTTP 200 OK.',
-      why: 'The server processes the request and produces the page.',
-      proto: 'HTTP semantics (inside TLS)',
-      visible: 'To the network: encrypted response bytes addressed to ' + publicIp() + ':' + publicPort() + '.',
-      changes: 'The RESPONSE JOURNEY begins — direction flips for good.'
-    },
-    onEnter() {
-      log('Google: request decrypted, response generated — 200 OK (HTML/CSS/JS/images)', 'ok');
-      highlightNodes(['server']);
-      renderEncap('res');
-    }
-  });
-
-  // --- Response journey ---
-  S.push({
-    id: 'response-journey',
-    title: '⬅ RESPONSE travels back across the Internet',
-    proto: 'TCP · carrying TLS',
-    dir: 'res',
-    packet: httpsRespPacket,
-    lifecycle: 6,
-    animate: () => ({ path: inPathToNat(), label: '200 OK 🔒 → ' + publicIp() + ':' + publicPort(), dir: 'res', perHop: 280,
-      hopLogs: isWifi() ? { r4: 'Response: R4 → R3 (reverse path, still simulated)' } : {} }),
-    explain: {
-      beginner: '⬅ RESPONSE STARTS HERE. The answer is addressed to your PUBLIC address and port — the one NAT created. It hops back across the Internet toward your ' + natDeviceName() + '.',
-      intermediate: `The response crosses backbone routers toward ${publicIp()}:${publicPort()}. Nothing in the packet names ${clientLabel()} — only the NAT mapping will reconnect it.`,
-      technical: 'Forward and return paths can differ in reality (asymmetric routing); the simulator reuses one path for clarity. Destination tuple (public IP + port) is the only handle the network has.'
-    },
-    learn: {
-      what: 'Encrypted response hops back through ISP/backbone routers.',
-      why: 'Routers forward toward the destination IP — your public NAT address.',
-      proto: 'IP routing (TTL decrementing again)',
-      visible: 'Headers: ' + GOOGLE_IP + ':443 → ' + publicIp() + ':' + publicPort() + ' (ciphertext payload).',
-      changes: 'Packet arrives at your ' + natDeviceName() + '.'
-    },
-    onEnter() {
-      log('RESPONSE: travelling back server → internet → ' + (isWifi() ? 'home router' : 'CGNAT'));
-      highlightNodes(isWifi() ? ['server', 'isp'] : ['server', 'cgnat']);
-    }
-  });
-
-  // --- NAT response ---
-  S.push({
-    id: 'nat-response',
-    title: '⬅ NAT lookup — which device gets this?',
-    proto: 'Stateful NAT',
-    dir: 'res',
-    packet: httpsRespPacket,
-    lifecycle: 7,
-    explain: {
-      beginner: `THE KEY MOMENT. The ${natDeviceName()} looks up ${publicIp()}:${publicPort()} in its table and finds: "that belongs to ${clientLabel()} at ${clientIp()}:${clientPort()}". That is why the page goes to the RIGHT computer — not ${isWifi() ? 'PC1, PC2, PC4 or PC5' : 'another subscriber'}.`,
-      intermediate: `Stateful NAT match on destination port ${publicPort()} → rewrite destination to ${clientIp()}:${clientPort()} → forward to the LAN. Without the stored mapping, the router could not choose an internal device and would drop the packet.`,
-      technical: `Connection-tracking tuple match (${publicIp()}:${publicPort()} ↔ ${clientIp()}:${clientPort()}). Port-based demultiplexing is precisely how one public IPv4 serves many devices — and unsolicited inbound traffic (no mapping) is dropped, which is also why NAT accidentally behaves like a firewall.`
-    },
-    learn: {
-      what: `NAT table hit: :${publicPort()} belongs to ${clientLabel()}.`,
-      why: 'The public packet has no idea which internal device asked — only stateful NAT knows.',
-      proto: 'NAT44 reverse translation',
-      visible: 'Destination rewritten: ' + publicIp() + ':' + publicPort() + ' → ' + clientIp() + ':' + clientPort() + '.',
-      changes: 'The response is now addressed to the correct device.'
-    },
-    onEnter() {
-      // Simulated NAT reverse lookup. This is not a real network connection.
-      el('cmp-nat').hidden = false;
-      el('cmp-nat').innerHTML = '';
-      const strong = document.createElement('strong');
-      strong.textContent = `Incoming ${publicIp()}:${publicPort()} → NAT table lookup → ${clientIp()}:${clientPort()} → ${clientLabel()}`;
-      el('cmp-nat').appendChild(strong);
-      renderNat();
-      log(`NAT: response for ${publicIp()}:${publicPort()} mapped to ${clientLabel()} (${clientIp()}:${clientPort()})`, 'ok');
-      highlightNodes([natNodeId()]);
-      switchTab('tables');
-    }
-  });
-
-  // --- Final delivery ---
-  S.push({
-    id: 'delivery',
-    title: '⬅ Final delivery — to the CORRECT device only',
-    proto: isWifi() ? 'Wi-Fi / Ethernet delivery' : 'Cellular delivery',
-    dir: 'res',
-    packet: httpsRespPacket,
-    lifecycle: 7,
-    animate: () => isWifi()
-      ? { path: ['router', client().id], label: 'frame → ' + client().mac, dir: 'res', perHop: 520 }
-      : { path: ['cgnat', 'core', 'tower', 'client'], label: '200 OK 🔒 → your device', dir: 'res', perHop: 380 },
-    explain: {
-      beginner: isWifi()
-        ? `The router wraps the packet in a Wi-Fi frame addressed to ${clientLabel()}'s MAC (${client().mac}). It is NOT broadcast to all five PCs — only ${clientLabel()} unwraps it.`
-        : 'The carrier delivers the data through the mobile core and cell tower straight to your device — the one that opened the connection.',
-      intermediate: isWifi()
-        ? `Layer-2 delivery: destination MAC ${client().mac}. Other stations see frame metadata but ignore frames not addressed to them. Connection state chose the IP; the MAC chose the device.`
-        : 'The packet-core session (created at attach) ties the downlink traffic to your device specifically — analogous to NAT state on the home router.',
-      technical: isWifi()
-        ? '802.11 unicast frame to the station associated with the destination MAC; WPA encryption applies at the link layer, independently of TLS. Broadcast-to-everyone would be incorrect — modern APs/switches forward per-station/per-port.'
-        : 'GTP-style tunneling from the core to the serving tower bears the user packet; the radio bearer identifies the subscriber session. Simplified here.'
-    },
-    learn: {
-      what: `Response delivered to ${clientLabel()} — and only ${clientLabel()}.`,
-      why: 'Connection state (NAT/session) picked the IP; link-layer addressing finished the job.',
-      proto: isWifi() ? '802.11 link layer' : 'Mobile core + radio bearer',
-      visible: isWifi() ? 'Frame on the local Wi-Fi addressed to one MAC.' : 'Encrypted tunnel to your device.',
-      changes: clientLabel() + ' now holds the encrypted response.'
-    },
-    onEnter() {
-      log(`Delivery: frame handed to ${clientLabel()}` + (isWifi() ? ` (dst MAC ${client().mac}; PC1/PC2/PC4/PC5 stay idle)` : ''), 'ok');
-      if (isWifi()) dimOtherPCs(true);
-      highlightNodes([isWifi() ? client().id : 'client']);
-    }
-  });
-
-  // --- Render ---
-  S.push({
-    id: 'render',
-    title: '🎉 Decrypt → parse → render',
-    proto: 'Browser engine',
-    dir: 'local',
-    explain: {
-      beginner: `${clientLabel()} decrypts the response with TLS, then the browser parses HTML, loads CSS, runs JavaScript — and draws the page. JOURNEY COMPLETE!`,
-      intermediate: 'TLS removes record protection → HTTP/2 stream reassembly → HTML parser → DOM/CSSOM → render tree → paint. Real pages open many more connections for sub-resources (not simulated).',
-      technical: 'Decapsulation: frame → IP → TCP reassembly → TLS record decrypt → HTTP semantics → rendering pipeline. One request/response shown; real page loads involve dozens of flows, QUIC, caching and CDN fetches.'
-    },
-    learn: {
-      what: 'Page rendered in the browser.',
-      why: 'Everything before this step existed to move these bytes reliably and privately.',
-      proto: 'TLS decrypt + browser rendering pipeline',
-      visible: 'Locally: full page. On the wire: still only ciphertext.',
-      changes: sim.domain + ' is now on screen.'
-    },
-    onEnter() {
-      hidePacket('Local stage — the browser is rendering.');
-      el('browser-url').textContent = 'https://' + sim.domain;
-      el('browser-bar').classList.add('secure');
-      log('Browser: TLS decrypt → HTML parsed → CSS loaded → JS executed → page rendered 🎉', 'ok');
-      highlightNodes([isWifi() ? client().id : 'client']);
-      showSummary(false);
-    }
-  });
-
-  return S;
-}
-
-let stages = [];
-
-// Some stages reference the compare tab hint without stealing focus
-function switchTabSilentlyHint() { /* intentionally a no-op; BGP stage only glows nodes */ }
-
-/* ===========================
-   9. FAILURE LAB
-   =========================== */
-
-const FAIL_INFO = {
-  'none': '',
-  'dns-fail': 'The resolver never answers. Without an IP address the browser cannot even start connecting: "' + 'google.com' + ' cannot be resolved."',
-  'router-fail': isWifi => isWifi ? 'The gateway ' + NET.gateway + ' is offline. ARP questions echo unanswered — the LAN still works, but nothing can leave it.' : '(Mobile mode: this failure applies to Wi-Fi; pick another scenario.)',
-  'nat-fail': 'The request leaves fine, but the NAT mapping is lost before the reply arrives. The response reaches the router — and is dropped, because nobody remembers which internal device asked.',
-  'packet-loss': 'One SYN is dropped in the backbone. TCP notices the silence and RETRANSMITS. The journey survives — reliability in action.',
-  'tcp-timeout': 'SYN goes out… and nothing ever comes back. TCP retries, then gives up: connection timed out.',
-  'tls-fail': 'The certificate fails validation (expired / wrong name / unknown CA, simulated). The browser aborts instead of trusting the connection.'
-};
-
-function updateFailDesc() {
-  el('fail-desc').textContent = FAIL_INFO[sim.failure]
-    ? (typeof FAIL_INFO[sim.failure] === 'function' ? FAIL_INFO[sim.failure](isWifi()) : FAIL_INFO[sim.failure])
-    : 'Healthy network — the full journey will complete.';
-}
-
-// Returns true when a fatal failure must interrupt at this stage.
-async function checkFailure(stage) {
-  const f = sim.failure;
-  if (f === 'none') return false;
-
-  const failStop = async (title, body) => {
-    showFailBox(title, body);
-    log('FAILURE: ' + title, 'err');
-    sim.stopped = true;
-    sim.playing = false;
-    updateControls();
-    await wait(700 / sim.speed);
-    showSummary(true, title, body);
-    return true;
-  };
-
-  if (f === 'dns-fail' && stage.id === 'dns-response') {
-    log('DNS: query sent… no answer. Retrying… still no answer', 'err');
-    return failStop('DNS unavailable', 'The resolver did not answer. The browser cannot translate ' + sim.domain + ' into an IP address, so no connection can even start. Fix: check the DNS server setting / resolver reachability.');
-  }
-  if (f === 'router-fail' && stage.id === 'arp-req') {
-    log('ARP: "who has ' + NET.gateway + '?" … silence. Gateway offline', 'err');
-    return failStop('Gateway offline', 'No ARP reply from ' + NET.gateway + '. The local network is fine — other PCs still answer — but the router is the only door to the Internet, and it is closed. Result: LAN available, Internet unavailable.');
-  }
-  if (f === 'packet-loss' && stage.id === 'tcp-syn') {
-    stage._dropAt = isWifi() ? 'r2' : 'r1';   // consumed by runStage
-    return false;                              // not fatal
-  }
-  if (f === 'tcp-timeout' && stage.id === 'tcp-synack') {
-    log('TCP: SYN sent… waiting… no SYN-ACK. Retransmitting…', 'err');
-    const p = stage.animate();                 // animate the lonely SYN-ack path out... actually retransmit out
-    await animatePacket(outPath(), { label: 'SYN (retry)', dir: 'req', perHop: 260, changes: natOutChange() });
-    sim.stats.retries++;
-    return failStop('TCP timeout', 'SYN went out twice and no SYN-ACK ever returned. Possible causes: the server is down, a firewall drops SYN-ACKs, or routing is broken past your ISP. TCP gives up after several retries — the application sees "connection timed out".');
-  }
-  if (f === 'tls-fail' && stage.id === 'tls-serverhello') {
-    return failStop('Certificate validation failed', 'The presented certificate did not pass validation (simulated): hostname mismatch / expired / untrusted CA. The browser ABORTS the TLS handshake — no encrypted channel, no request, no page. This protects you from impersonation (MITM).');
-  }
-  if (f === 'nat-fail' && stage.id === 'nat-response') {
-    log('NAT: response arrived for :' + publicPort() + ' — but the mapping is gone. DROPPED', 'err');
-    return failStop('NAT mapping lost', 'The outbound packet created state, but that state was lost (timeout/reboot, simulated). When the response reached ' + publicIp() + ':' + publicPort() + ', the ' + natDeviceName() + ' had no idea which internal device owned it and dropped it. The client will retransmit until TCP times out.');
-  }
-  return false;
-}
-
-function showFailBox(title, body) {
-  const fb = el('fail-box');
-  fb.hidden = false;
-  fb.innerHTML = '';
-  const s = document.createElement('strong'); s.textContent = '✕ ' + title;
-  const p = document.createElement('p'); p.textContent = body; p.style.margin = '.3rem 0 0';
-  fb.appendChild(s); fb.appendChild(p);
-}
-
-/* ===========================
-   10. STAGE RUNNER + CONTROLS
-   =========================== */
-
-function explainFor(stage) {
-  return stage.explain[sim.level] || stage.explain.beginner;
-}
-
-function renderStageUI(stage, idx) {
-  el('stage-title').textContent = stage.title;
-  el('stage-proto').textContent = stage.proto;
-  const dir = el('stage-dir');
-  dir.textContent = { req: '➜ REQUEST · client → server', res: '⬅ RESPONSE · server → client', local: 'LOCAL STAGE' }[stage.dir];
-  dir.className = 'badge badge-dir dir-' + stage.dir;
-  el('stage-explain').textContent = explainFor(stage);
-  el('learn-what').textContent = stage.learn.what;
-  el('learn-why').textContent = stage.learn.why;
-  el('learn-proto').textContent = stage.learn.proto;
-  el('learn-visible').textContent = stage.learn.visible;
-  el('learn-changes').textContent = stage.learn.changes;
-
-  const total = stages.length;
-  el('step-counter').textContent = `Step ${idx + 1} / ${total}`;
-  el('progress-fill').style.width = ((idx + 1) / total * 100) + '%';
-  el('progress-stage').textContent = stage.title.length > 22 ? stage.title.slice(0, 22) + '…' : stage.title;
-  document.title = `Step ${idx + 1}/${total} · Internet Journey Simulator`;
-}
-
-async function runStage(idx) {
-  if (idx < 0 || idx >= stages.length) return;
-  sim.step = idx;
-  sim.animating = true;
-  updateControls();
-
-  const stage = stages[idx];
-  renderStageUI(stage, idx);
-
-  // Packet inspector for this stage
-  if (stage.packet) {
-    showPacket(stage.packet(),
-      stage.dir === 'req' ? '➜ Outbound packet (client → server)' : '⬅ Inbound packet (server → client)',
-      stage.lifecycle != null ? stage.lifecycle : 3);
-  }
-
-  if (stage.onEnter) stage.onEnter();
-
-  // Failure interception (may stop the journey)
-  const fatal = await checkFailure(stage);
-  if (fatal) { sim.animating = false; updateControls(); return; }
-
-  // Packet-loss special case: first traversal drops mid-backbone, then retransmits.
-  if (stage._dropAt) {
-    const a = stage.animate();
-    log('Link interference: packet dropped at ' + stage._dropAt.toUpperCase() + ' — TCP will retransmit', 'err');
-    const path = a.path;
-    const cut = path.slice(0, path.indexOf(stage._dropAt) + 1);
-    await animatePacket(cut, { label: a.label, dir: 'req', perHop: a.perHop, changes: a.changes, dropAt: stage._dropAt });
-    sim.stats.retries++;
-    await wait(700 / sim.speed);
-    log('TCP: retransmission timer fired — sending again', 'sys');
-    await animatePacket(path, { label: a.label + ' (retry)', dir: 'req', perHop: a.perHop, changes: a.changes, hopLogs: a.hopLogs });
-    log('TCP: retransmitted packet made it through ✔', 'ok');
-    stage._dropAt = null;
-  } else if (stage.animate) {
-    const a = stage.animate();
-    await animatePacket(a.path, a);
-  }
-
-  el('net').querySelectorAll('.link').forEach(l => l.classList.remove('active'));
-  sim.animating = false;
-  updateControls();
-
-  // Auto-advance
-  if (sim.playing && !sim.stopped) {
-    await wait(900 / sim.speed);
-    if (sim.playing && !sim.stopped && sim.step < stages.length - 1) runStage(sim.step + 1);
-    else { sim.playing = false; updateControls(); }
-  }
-}
-
-function updateControls() {
-  const done = sim.step >= stages.length - 1 || sim.stopped;
-  el('btn-start').textContent = sim.playing ? '▶ Running…' : (sim.step >= 0 && !done ? '▶ Resume' : '▶ Start Simulation');
-  el('btn-start').disabled = sim.playing || done || sim.animating;
-  el('btn-next').disabled = sim.playing || done || sim.animating;
-  el('btn-pause').disabled = !sim.playing;
-}
-
-function start() {
-  if (sim.step >= sim.length) return;
-  if (sim.step < 0 || sim.stopped) { reset(false); }
-  sim.playing = true;
-  updateControls();
-  runStage(sim.step + 1);
-}
-
-function pause() {
-  sim.playing = false;
-  updateControls();
-  log('Simulation paused');
-}
-
-function next() {
-  if (sim.step < stages.length - 1 && !sim.stopped && !sim.animating) runStage(sim.step + 1);
-}
-
-function reset(clearFailureToo = true) {
-  // Clean up timers, animations, sprites
-  sim.playing = false;
-  clearTimers();
-  clearPackets();
-
-  Object.assign(sim, {
-    step: -1, stopped: false, animating: false,
-    nat: [], dns: {}, arp: {},
-    stats: { packets: 0, retries: 0, roundTrips: 4 }
-  });
-
-  if (clearFailureToo === true) { /* keep chosen failure unless caller resets it */ }
-
-  stages = buildStages();
-  renderTopology();
-  renderNat(); renderDns(); renderArp();
-  renderEncap('req');
-  dimOtherPCs(false);
-  el('fail-box').hidden = true;
-  el('cmp-nat').hidden = true;
-  el('browser-url').textContent = 'about:blank';
-  el('browser-bar').classList.remove('secure');
-  el('step-counter').textContent = 'Step 0 / ' + stages.length;
-  el('progress-fill').style.width = '0%';
-  el('progress-stage').textContent = 'Ready';
-  el('stage-title').textContent = 'Ready';
-  el('stage-proto').textContent = '—';
-  el('stage-dir').textContent = '—';
-  el('stage-explain').textContent = 'Press ▶ Start Simulation (or GO in the address bar) to watch the full journey, or ⏭ Next Step to walk through one stage at a time.';
-  ['learn-what', 'learn-why', 'learn-proto', 'learn-visible', 'learn-changes'].forEach(id => el(id).textContent = '—');
-  hidePacket('No packet yet. Start the simulation, then watch this inspector update at every stage.');
-  document.title = 'Internet Journey Simulator';
-  el('summary').hidden = true;
-  updateControls();
-  log('Simulation reset — ' + (isWifi() ? 'Wi-Fi mode, client ' + client().name : 'Mobile data mode') + (sim.failure !== 'none' ? ' · failure armed: ' + el('fail-select').selectedOptions[0].textContent : ''));
-}
-
-/* ===========================
-   11. SUMMARY OVERLAY
-   =========================== */
-
-function showSummary(isErr, errTitle, errBody) {
-  const s = el('summary');
-  const card = s.querySelector('.summary-card');
-  card.classList.toggle('err', !!isErr);
-  el('summary-title').textContent = isErr ? '✕ Journey interrupted' : '🎉 JOURNEY COMPLETE';
-  const b = el('summary-body');
-  b.innerHTML = '';
-
-  if (isErr) {
-    const t = document.createElement('h3'); t.textContent = errTitle; t.style.color = 'var(--red)'; t.style.textTransform = 'none';
-    const p = document.createElement('p'); p.textContent = errBody;
-    b.appendChild(t); b.appendChild(p);
-  } else {
-    b.innerHTML = '<dl class="kv">' + [
-      ['You typed', sim.domain],
-      ['Connection', isWifi() ? 'Wi-Fi' : 'Mobile data'],
-      ['Client', clientLabel() + ' (' + clientIp() + ')'],
-      ['DNS', 'resolved → ' + GOOGLE_IP + ' (simulated)'],
-      ['NAT', 'translated at the ' + natDeviceName()],
-      ['TCP', 'established (SYN / SYN-ACK / ACK)'],
-      ['TLS', 'established (TLS 1.3, certificate validated)'],
-      ['HTTPS', 'request sent, response received'],
-      ['Delivered to', clientLabel() + ' — the correct device ✔'],
-      ['Browser', 'page rendered'],
-      ['Simulated steps', String(stages.length)],
-      ['Packets animated', String(sim.stats.packets)],
-      ['Retransmissions', String(sim.stats.retries)],
-      ['Round trips (DNS+TCP+TLS+HTTPS)', String(sim.stats.roundTrips)]
-    ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>';
-  }
-  s.hidden = false;
-}
-
-/* ===========================
-   12. UI BINDINGS
-   =========================== */
-
-function switchTab(name) {
-  document.querySelectorAll('.tab-btn').forEach(b => {
-    const on = b.dataset.tab === name;
-    b.classList.toggle('active', on);
-    b.setAttribute('aria-selected', on);
-  });
-  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
-}
-
-function populateClients() {
-  const sel = el('client-select');
-  sel.innerHTML = '';
-  for (let i = 1; i <= 5; i++) {
-    const o = document.createElement('option');
-    o.value = String(i);
-    o.textContent = 'PC ' + i;
-    sel.appendChild(o);
-  }
-  sel.value = String(sim.clientNum);
-}
-
-function applyMode() {
-  el('client-select-wrap').style.display = isWifi() ? '' : 'none';
-  el('multi-pc-wrap').style.display = isWifi() ? '' : 'none';
-  el('arp-wrap').style.display = isWifi() ? '' : 'none';
-  const ro = el('fail-opt-router');
-  ro.disabled = !isWifi();
-  if (!isWifi() && sim.failure === 'router-fail') { sim.failure = 'none'; el('fail-select').value = 'none'; }
-  updateFailDesc();
-}
-
-function validDomain(d) {
-  return /^(?!-)[a-z0-9-]{1,63}(?<!-)(\.[a-z0-9-]{1,63}(?<!-))+$/.test(d) && /\.[a-z]{2,}$/.test(d);
-}
-
-function init() {
-  populateClients();
-  stages = buildStages();
-
-  // Tabs
-  document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
-
-  // Controls
-  el('btn-start').addEventListener('click', start);
-  el('btn-next').addEventListener('click', next);
-  el('btn-pause').addEventListener('click', pause);
-  el('btn-reset').addEventListener('click', () => { sim.failure = el('fail-select').value; reset(); log('Reset by user'); });
-
-  el('conn-select').addEventListener('change', e => {
-    sim.mode = e.target.value;
-    applyMode();
-    reset();
-  });
-  el('client-select').addEventListener('change', e => {
-    sim.clientNum = parseInt(e.target.value, 10);
-    reset();
-    log('Selected device: ' + client().name + ' (' + client().ip + ')');
-  });
-  el('level-select').addEventListener('change', e => {
-    sim.level = e.target.value;
-    if (sim.step >= 0 && stages[sim.step]) renderStageUI(stages[sim.step], sim.step);
-  });
-  el('speed').addEventListener('input', e => {
-    sim.speed = parseFloat(e.target.value);
-    el('speed-val').textContent = sim.speed + 'x';
-  });
-  el('multi-pc').addEventListener('change', e => {
-    sim.multi = e.target.checked;
-    log('Multi-PC NAT demo ' + (sim.multi ? 'enabled — watch the NAT table at the TCP handshake' : 'disabled'));
-  });
-  el('learning-mode').addEventListener('change', e => {
-    el('learn-box').style.display = e.target.checked ? '' : 'none';
-  });
-  el('fail-select').addEventListener('change', e => {
-    sim.failure = e.target.value;
-    updateFailDesc();
-    reset();
-  });
-
-  // Layer picker
-  document.querySelectorAll('.layer-btn').forEach(b => b.addEventListener('click', () => activateLayer(b.dataset.layer)));
-
-  // Routing device select
-  el('rt-select').addEventListener('change', e => renderRouting(e.target.value));
-
-  // Log
-  el('btn-clear-log').addEventListener('click', () => { el('event-log').innerHTML = ''; });
-
-  // Browser GO
-  el('go-form').addEventListener('submit', e => {
-    e.preventDefault();
-    const d = el('domain-input').value.trim().toLowerCase();
-    if (!validDomain(d)) {
-      el('domain-input').classList.add('invalid');
-      log('Browser: "' + d + '" is not a valid domain name', 'err');
+    dot.removeAttribute('hidden');
+    const pts = pathPoints(state.net, ids);
+    if (pts.length < 2 || prefersReducedMotion()) {
+      const last = pts[pts.length - 1] || { x: 0, y: 0 };
+      dot.setAttribute('cx', last.x); dot.setAttribute('cy', last.y);
+      later(onDone, prefersReducedMotion() ? 60 : totalMs);
       return;
     }
-    el('domain-input').classList.remove('invalid');
-    sim.domain = d;
-    reset();
-    sim.step = -1;
-    start();
-  });
-  el('domain-input').addEventListener('input', () => el('domain-input').classList.remove('invalid'));
+    const segCount = pts.length - 1;
+    const start = performance.now();
+    function seg(pt) { return pt; }
+    function frame(now) {
+      const t = clamp((now - start) / totalMs, 0, 1);
+      const segT = t * segCount;
+      const i = clamp(Math.floor(segT), 0, segCount - 1);
+      const localT = clamp(segT - i, 0, 1);
+      const a = seg(pts[i]), b = seg(pts[i + 1]);
+      dot.setAttribute('cx', a.x + (b.x - a.x) * localT);
+      dot.setAttribute('cy', a.y + (b.y - a.y) * localT);
+      if (t < 1 && state.animToken === animateAlong._token) requestAnimationFrame(frame);
+      else onDone();
+    }
+    animateAlong._token = (animateAlong._token || 0) + 1;
+    state.animToken = animateAlong._token;
+    requestAnimationFrame(frame);
+  }
+  function svgEl(tag, attrs) { return svg(tag, attrs); }
 
-  // Compare actions
-  el('cmp-wifi').addEventListener('click', () => { el('conn-select').value = 'wifi'; el('conn-select').dispatchEvent(new Event('change')); });
-  el('cmp-mobile').addEventListener('click', () => { el('conn-select').value = 'mobile'; el('conn-select').dispatchEvent(new Event('change')); });
+  /* ------------------------------------------------------------------------
+   * 4. Stage data — the journey as data. One function builds every stage for
+   *    the current mode/client/destination, so Wi-Fi and Mobile reuse the
+   *    exact same engine and only the underlying `net` differs.
+   * ---------------------------------------------------------------------- */
+  function buildStages(state) {
+    const net = state.net, dest = state.dest, mode = state.mode;
+    const r = net.roles;
+    const client = net.nodes[r.client];
+    const isWifi = mode === 'wifi';
+    const L2NAME = isWifi ? 'Wi-Fi access point' : 'cell tower';
+    const GWNAME = net.nodes[r.gw].name;
+    const NATNAME = net.nodes[r.nat].name;
+    const S = [];
+    const push = (o) => S.push(o);
 
-  // Modal
-  el('modal-close').addEventListener('click', () => { el('modal').hidden = true; });
-  el('modal').addEventListener('click', e => { if (e.target === el('modal')) el('modal').hidden = true; });
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') { el('modal').hidden = true; el('summary').hidden = true; }
-  });
+    push({
+      id: 'start', phase: 'Browser', dir: 'local', proto: '—', kind: 'url',
+      title: 'You type a web address',
+      real: 'A browser only knows a hostname (e.g. ' + dest.name + '). It has no idea yet which computer that name belongs to.',
+      simp: 'Autocomplete, search suggestions and typo-correction are switched off here.',
+      learn: { what: 'You entered "' + client.hostname + ' → ' + dest.name + '" and pressed GO.', why: 'Every web request starts as a human-readable name, not a number.', proto: 'HTTP(S) URL', transport: '—', port: '—', visible: 'Nothing has left the computer yet.', changes: 'The browser now needs an IP address for "' + dest.name + '".' },
+      levels: {
+        beginner: 'You typed "' + dest.name + '" and pressed GO. Computers do not understand names directly — the browser first has to translate that name into a numeric address.',
+        intermediate: '"' + dest.name + '" is a hostname, not an address. Before ' + client.hostname + ' can open a connection, it must resolve the name to an IP address via DNS.',
+        technical: 'The browser parses the URL, checks its own cache for a cached A/AAAA record, and — finding none — prepares a DNS query for "' + dest.name + '".'
+      }, path: null
+    });
 
-  // Summary actions
-  el('summary').addEventListener('click', e => {
-    const act = e.target.closest('[data-act]');
-    if (!act) return;
-    el('summary').hidden = true;
-    if (act.dataset.act === 'replay') { reset(); start(); }
-    else if (act.dataset.act === 'compare') switchTab('compare');
-    else if (act.dataset.act === 'lab') switchTab('lab');
-    else if (act.dataset.act === 'explore') switchTab('inspector');
-  });
+    push({
+      id: 'dns-q', phase: 'DNS', dir: 'req', proto: 'DNS · UDP/53', kind: 'dns-query',
+      title: 'DNS query leaves the computer',
+      real: 'DNS (Domain Name System) turns names into IP addresses. Your computer normally asks the resolver configured by DHCP.',
+      simp: 'Recursive resolution across root/TLD/authoritative servers is simplified to one "ISP resolver" step.',
+      learn: { what: client.hostname + ' sends a DNS query for "' + dest.name + '" (type A) to its resolver ' + client.dns + '.', why: 'Applications and the OS network stack work with IP addresses, not names.', proto: 'DNS', transport: 'UDP', port: '53', visible: 'The domain name being looked up, in the clear.', changes: 'A DNS query packet now exists and is being routed towards the resolver.' },
+      levels: {
+        beginner: 'The computer asks a "phone book for the Internet" (DNS) what number belongs to "' + dest.name + '".',
+        intermediate: client.hostname + ' sends a DNS query to its configured resolver (' + client.dns + ') asking for the A record of "' + dest.name + '".',
+        technical: 'A UDP/53 DNS query (QTYPE=A, QNAME=' + dest.name + ') is generated with a random transaction ID and forwarded to the configured resolver.'
+      },
+      path: isWifi ? [r.client, r.l2, r.gw] : [r.client, r.l2, r.gw],
+      action: (st) => {
+        st.dnsQuery = { name: dest.name, type: 'A', id: 0x4d2 };
+      }
+    });
 
-  // Keyboard shortcuts (skip when typing in fields)
-  document.addEventListener('keydown', e => {
-    const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
-    if (!el('modal').hidden || !el('summary').hidden) return;
-    if (e.key === 'ArrowRight') { e.preventDefault(); next(); }
-    else if (e.key === ' ') { e.preventDefault(); sim.playing ? pause() : start(); }
-    else if (e.key.toLowerCase() === 'r') { reset(); }
-  });
+    push({
+      id: 'dns-recurse', phase: 'DNS', dir: 'req', proto: 'DNS · UDP/53', kind: 'dns-recurse',
+      title: 'The resolver looks the name up',
+      real: 'A real recursive resolver walks root → TLD (.com) → authoritative name servers if it has no cached answer.',
+      simp: 'That multi-step walk is shown as a single "ISP recursive resolver" lookup here.',
+      learn: { what: 'The ISP\u2019s recursive resolver checks its cache, then (in real life) queries root, .com and authoritative servers.', why: 'No single server holds every domain on Earth — the lookup is delegated in stages.', proto: 'DNS', transport: 'UDP', port: '53', visible: 'Still just the domain name.', changes: 'The resolver now has an answer ready to send back.' },
+      levels: {
+        beginner: 'The ISP\u2019s "directory service" figures out the correct address for ' + dest.name + '.',
+        intermediate: 'The recursive resolver (hosted at the ISP core in this simulation) resolves the name, consulting root → .com → authoritative servers if needed.',
+        technical: 'Recursive resolution: root hint → .com TLD referral → authoritative NS for ' + dest.name + ' → A record returned, cached with its TTL.'
+      }, path: null
+    });
 
-  applyMode();
-  reset();
-  log('Internet Journey Simulator ready — all addresses and routes are simulated');
-}
+    push({
+      id: 'dns-r', phase: 'DNS', dir: 'resp', proto: 'DNS · UDP/53', kind: 'dns-response',
+      title: 'DNS response comes back',
+      real: 'The resolver returns an A record and a TTL (time-to-live) telling the browser how long it may cache the answer.',
+      simp: 'One simulated address is returned; real Google responses often include several addresses for load-balancing.',
+      learn: { what: 'The resolver answers: ' + dest.name + ' = ' + dest.ip + ' (TTL 300s).', why: 'The browser now has a numeric destination it can route packets to.', proto: 'DNS', transport: 'UDP', port: '53', visible: 'The resolved IP address and TTL.', changes: 'The IP address is cached locally so future lookups can skip this whole step.' },
+      levels: {
+        beginner: 'The answer comes back: "' + dest.name + ' is at ' + dest.ip + '." The browser saves this for a little while.',
+        intermediate: 'A DNS response arrives with an A record (' + dest.ip + ') and TTL, which the OS stub resolver caches.',
+        technical: 'DNS response (matching transaction ID) delivers RR: ' + dest.name + ' A ' + dest.ip + ' TTL=300. Cached client-side until expiry.'
+      },
+      path: [r.gw, r.l2, r.client],
+      action: (st) => { st.dns.store(dest.name, 'A', dest.ip, 300); }
+    });
 
-document.addEventListener('DOMContentLoaded', init);
+    if (isWifi) {
+      push({
+        id: 'arp-r', phase: 'ARP', dir: 'req', proto: 'ARP', kind: 'arp-request',
+        title: 'ARP: "who has the router\u2019s MAC address?"',
+        real: 'On a LAN, IP addresses are not enough to deliver a frame — the sender needs the destination\u2019s MAC (hardware) address.',
+        simp: 'ARP is shown only for the client ↔ router hop; every real device also does this.',
+        learn: { what: client.hostname + ' broadcasts "Who has ' + client.gateway + '? Tell ' + client.ip + '."', why: 'Ethernet/Wi-Fi frames are addressed by MAC, not IP.', proto: 'ARP', transport: '—', port: '—', visible: 'The broadcast is seen by every device on the Wi-Fi segment.', changes: 'The router will reply with its MAC address.' },
+        levels: {
+          beginner: 'Before sending data, the computer shouts on the local network: "Who has address ' + client.gateway + '?" — it needs a hardware address, not just an IP.',
+          intermediate: client.hostname + ' has no ARP entry for the gateway ' + client.gateway + ', so it broadcasts an ARP request on the Wi-Fi segment.',
+          technical: 'ARP request broadcast (dst FF:FF:FF:FF:FF:FF): "Who has ' + client.gateway + '? Tell ' + client.ip + ' (' + client.mac + ')."'
+        }, path: [r.client, r.l2]
+      });
+      push({
+        id: 'arp-y', phase: 'ARP', dir: 'resp', proto: 'ARP', kind: 'arp-reply',
+        title: 'ARP reply: the router answers',
+        real: 'Only the router recognises its own IP and replies directly (unicast) with its MAC address.',
+        simp: '—',
+        learn: { what: 'The router replies: "' + client.gateway + ' is at ' + net.nodes[r.gw].macs.lan + '."', why: 'Now the computer can address Ethernet/Wi-Fi frames directly to the router.', proto: 'ARP', transport: '—', port: '—', visible: 'The router\u2019s MAC address.', changes: 'Both devices cache this mapping (ARP cache) for a while.' },
+        levels: {
+          beginner: 'The router answers back privately: "That\u2019s me — here is my hardware address."',
+          intermediate: 'The router unicasts an ARP reply with its LAN MAC (' + net.nodes[r.gw].macs.lan + '); ' + client.hostname + ' caches the mapping.',
+          technical: 'ARP reply: ' + client.gateway + ' is-at ' + net.nodes[r.gw].macs.lan + '. Both ends insert the pair into their ARP cache (typically ~60s–4h TTL).'
+        }, path: [r.l2, r.client],
+        action: (st) => { st.arp.store(client.gateway, net.nodes[r.gw].macs.lan); st.arp.learn(client.mac, r.client); st.arp.learn(net.nodes[r.gw].macs.lan, r.gw); }
+      });
+    }
+
+    push({
+      id: 'construct', phase: 'Packet', dir: 'local', proto: 'Ethernet + IPv4 + TCP', kind: 'construct',
+      title: 'The request packet is built (encapsulation)',
+      real: 'Each layer wraps the one above it: application data → TCP segment → IP packet → Ethernet/Wi-Fi frame.',
+      simp: 'A single simplified packet stands in for what is really several TLS/TCP segments.',
+      learn: { what: 'The OS wraps the outgoing data in TCP, then IP, then a link-layer frame.', why: 'Every layer adds the addressing/control info the next network device needs.', proto: 'Ethernet/IPv4/TCP', transport: 'TCP', port: '443', visible: 'Headers only at this point — no data sent yet.', changes: 'A fully-formed packet is ready to leave the computer.' },
+      levels: {
+        beginner: 'The computer wraps your request in layers, like putting a letter in an envelope, then that envelope in a shipping box.',
+        intermediate: 'The OS builds a TCP segment (dest port 443), wraps it in an IP packet (src ' + client.ip + ', dst ' + dest.ip + '), then in a Wi-Fi/Ethernet frame.',
+        technical: 'Encapsulation: L4 TCP header (SYN, seq=x) → L3 IPv4 header (TTL 64, proto=6) → L2 frame (src ' + client.mac + ').'
+      }, path: null,
+      action: (st) => { st.tcpPort = 50000 + Math.floor(Math.random() * 1000); st.serverPort = 443; }
+    });
+
+    push({
+      id: 'to-router', phase: 'Local delivery', dir: 'req', proto: 'Ethernet/Wi-Fi', kind: 'packet',
+      title: 'Frame crosses the ' + (isWifi ? 'Wi-Fi network' : 'radio link') + ' to ' + GWNAME,
+      real: (isWifi ? 'The ' + L2NAME + ' forwards the frame by MAC address; it does not look at or change the IP addresses.' : 'The phone\u2019s IP traffic is carried inside a GTP-U tunnel to the mobile core — there is no MAC addressing on the radio link.'),
+      simp: 'Signal strength, retransmissions and Wi-Fi contention are not modelled.',
+      learn: { what: 'The frame travels from ' + client.hostname + ' to ' + GWNAME + '.', why: 'This is the first hop towards the wider Internet.', proto: isWifi ? 'Wi-Fi (802.11)' : 'Cellular radio', transport: 'TCP', port: String(443), visible: 'Source/destination MAC (Wi-Fi) or tunnel ID (mobile); IP/TCP headers if inspected.', changes: isWifi ? 'The switch/AP learns which port the client\u2019s MAC is on.' : 'The mobile core assigns/maintains the session.' },
+      levels: {
+        beginner: 'Your device sends the packet over ' + (isWifi ? 'Wi-Fi' : 'the mobile signal') + ' to the ' + GWNAME + '.',
+        intermediate: 'The frame leaves ' + client.hostname + ' and arrives at ' + GWNAME + ' via the ' + L2NAME + '.',
+        technical: isWifi ? 'L2 frame forwarded across the WLAN; the AP switch learns ' + client.mac + ' on its client-facing port.' : 'IP packet tunnelled over the radio bearer (GTP-U) from the phone to the ' + L2NAME + ', then to the mobile core.'
+      },
+      path: [r.client, r.l2, r.gw],
+      kindPacket: true
+    });
+
+    push({
+      id: 'route', phase: 'Routing', dir: 'req', proto: 'IPv4', kind: 'route',
+      title: GWNAME + ' makes a routing decision',
+      real: 'A router consults its routing table and forwards based on the longest matching prefix for the destination IP.',
+      simp: 'Real home routers usually just have a default route; this simulator shows the lookup explicitly for teaching.',
+      learn: { what: GWNAME + ' looks up ' + dest.ip + ' in its routing table and matches the default route towards the ISP.', why: 'Routing tables decide which direction (interface) each packet should leave on.', proto: 'IPv4', transport: '—', port: '—', visible: 'The routing table entries.', changes: 'The packet is queued to leave on the WAN/uplink interface — and will be NAT-translated.' },
+      levels: {
+        beginner: 'The ' + GWNAME + ' checks its "map of the Internet" and decides which direction to send your packet.',
+        intermediate: GWNAME + ' performs a longest-prefix-match lookup for ' + dest.ip + ' against its routing table and selects the default/uplink route.',
+        technical: 'Routing table lookup: no more-specific match than 0.0.0.0/0, so the packet egresses via the WAN interface toward ' + (isWifi ? 'the ISP access router' : 'CGNAT') + '.'
+      }, path: null
+    });
+
+    push({
+      id: 'nat', phase: 'NAT', dir: 'req', proto: 'NAT', kind: 'nat',
+      title: NATNAME + ' translates the address (NAT)',
+      real: 'Network Address Translation rewrites the private source IP (and port) to a public one so the packet can travel the Internet, and remembers the mapping.',
+      simp: 'Real routers manage thousands of simultaneous NAT sessions; here you can inspect the table directly.',
+      learn: { what: client.ip + ':(an ephemeral port)' + ' is translated to ' + net.nodes[r.nat].wanIp + ':(a public port).', why: 'Private (RFC1918/CGNAT) addresses are not routable on the public Internet.', proto: 'NAT', transport: 'TCP/UDP', port: 'varies', visible: 'The NAT translation table.', changes: 'A new row appears in the NAT table; it is this row that lets the reply find its way back.' },
+      levels: {
+        beginner: 'Your computer\u2019s private address is swapped for the household\u2019s single public address — like a company mailroom stamping a return address on outgoing mail.',
+        intermediate: NATNAME + ' rewrites ' + client.ip + ':(ephemeral port) → ' + net.nodes[r.nat].wanIp + ':(public port) and stores the mapping so replies can be routed back correctly.',
+        technical: 'Source NAT (masquerade): (' + client.ip + ', ephemeral) ⇄ (' + net.nodes[r.nat].wanIp + ', public) keyed by (proto, dstIP, dstPort); entry added to the connection-tracking table.'
+      }, path: null,
+      action: (st) => {
+        const e = st.nat.allocate(st.clientId, client.hostname, client.ip, dest.ip, 443, 'TCP');
+        st.currentNat = e;
+      }
+    });
+
+    // ---- ISP hops ----
+    const ispChain = isWifi ? [[r.gw, r.ispA, 'ISP access router'], [r.ispA, r.ispB, 'ISP aggregation router'], [r.ispB, r.ispC, 'ISP core router']]
+                              : [[r.nat, r.ispA, 'ISP / transit router']];
+    ispChain.forEach(([from, to, label], i) => {
+      push({
+        id: 'isp-' + i, phase: 'ISP', dir: 'req', proto: 'IPv4', kind: 'packet',
+        title: 'Packet reaches the ' + label,
+        real: 'Your ISP carries the packet across its own network towards its peering/transit points.',
+        simp: 'Real ISP topologies have many more routers; three representative hops stand in for the whole network.',
+        learn: { what: 'The packet is forwarded from ' + net.nodes[from].name + ' to ' + net.nodes[to].name + '.', why: 'Getting from your home network to the wider Internet takes several router hops inside the ISP.', proto: 'IPv4', transport: 'TCP', port: '443', visible: 'TTL decrements by one at every routed hop.', changes: 'Nothing changes about the addressing here — this is a plain forwarded hop.' },
+        levels: {
+          beginner: 'The packet moves deeper into your Internet provider\u2019s network, one hop closer to ' + dest.name + '.',
+          intermediate: 'The ISP forwards the packet from ' + net.nodes[from].name + ' towards ' + net.nodes[to].name + ' based on its own internal routing.',
+          technical: 'Hop-by-hop IPv4 forwarding inside AS64500; TTL decremented, next-hop chosen from ' + net.nodes[from].name + '\u2019s routing table.'
+        }, path: [from, to]
+      });
+    });
+
+    push({
+      id: 'backbone', phase: 'Internet backbone', dir: 'req', proto: 'IPv4 · BGP-routed', kind: 'packet',
+      title: 'SIMULATED INTERNET PATH — crossing the backbone (R1 → R4)',
+      real: 'Traffic between large networks crosses Internet exchange points and backbone/transit routers; the exact path depends on live BGP routing at that moment.',
+      simp: 'R1–R4 are four illustrative routers, not a real traceroute. A genuine path could be 5, 10 or 20+ hops and change between requests.',
+      learn: { what: 'The packet crosses four simulated backbone routers (R1–R4) between your ISP and ' + dest.name + '.', why: 'The Internet is a "network of networks" — no single operator owns the whole path.', proto: 'IPv4', transport: 'TCP', port: '443', visible: 'TTL keeps decrementing; each router only knows the next hop, not the whole path.', changes: 'The packet is now leaving AS64500 and entering transit/backbone networks.' },
+      levels: {
+        beginner: 'The packet now travels across "the Internet" itself — several unrelated networks operated by different companies, each just passing it one step closer.',
+        intermediate: 'The packet is forwarded across four illustrative backbone routers (R1–R4) representing transit networks between your ISP and ' + dest.name + '. This is not a real traceroute.',
+        technical: 'Simulated inter-domain path R1(AS64500)→R2→R3→R4(AS64501), each performing a routing-table lookup toward ' + dest.prefix + '. A real path is determined by live BGP policy and can differ every time.'
+      }, path: [r.ispA === r.ispC ? r.ispA : r.ispC, 'r1', 'r2', 'r3', 'r4']
+    });
+
+    push({
+      id: 'bgp', phase: 'BGP', dir: 'local', proto: 'BGP (simplified)', kind: 'bgp',
+      title: 'How networks agree on a path (BGP, simplified)',
+      real: 'BGP (Border Gateway Protocol) is how Autonomous Systems (AS) exchange reachability information and agree on inter-network routes.',
+      simp: 'This is a static, illustrative AS diagram — not a live BGP table, and BGP operates between networks, not per packet.',
+      learn: { what: 'AS64500 (your ISP) → AS64501 (transit) → AS' + dest.as + ' (' + dest.asName + ') is the simulated AS path.', why: 'BGP is how the Internet\u2019s independent networks discover routes to each other.', proto: 'BGP', transport: 'TCP/179 (between routers)', port: '—', visible: 'An AS path, not individual packets.', changes: '—' },
+      levels: {
+        beginner: 'Big networks (like your ISP and ' + dest.name + ') agree ahead of time on which of them will carry traffic for which addresses.',
+        intermediate: 'Each Autonomous System advertises the address ranges it can reach; ' + dest.name + '\u2019s route to you travels AS64500 → AS64501 → AS' + dest.as + '.',
+        technical: 'Simplified AS-path: 64500 64501 ' + dest.as + '. Real BGP updates carry NEXT_HOP, AS_PATH and policy attributes and are exchanged continuously between routers, not per packet.'
+      }, path: null
+    });
+
+    push({
+      id: 'edge', phase: dest.name + ' network', dir: 'req', proto: 'IPv4 · Anycast', kind: 'packet',
+      title: 'Packet reaches the ' + dest.name + ' edge',
+      real: 'Large services announce the same IP address from many locations worldwide (anycast) so users connect to a nearby one automatically.',
+      simp: 'Only one edge/server pair is modelled; a real provider has many edge locations and internal load-balancing.',
+      learn: { what: 'The packet arrives at a ' + dest.name + ' edge location for ' + dest.ip + '.', why: 'Anycast routes the same address to whichever announcing location is topologically closest.', proto: 'IPv4', transport: 'TCP', port: '443', visible: 'The destination address, still ' + dest.ip + '.', changes: 'From here the request is handed to a nearby server.' },
+      levels: {
+        beginner: 'The packet arrives at a ' + dest.name + ' location near you — big services have many entry points around the world.',
+        intermediate: 'Because ' + dest.ip + ' is announced from multiple locations (anycast), your packet naturally lands at a nearby ' + dest.name + ' edge.',
+        technical: 'Anycast routing directs the packet to the topologically nearest edge announcing ' + dest.prefix + '. TLS/HTTP termination happens close to the user to reduce latency.'
+      }, path: ['r4', 'edge']
+    });
+
+    push({
+      id: 'tcp-syn', phase: 'TCP handshake', dir: 'req', proto: 'TCP', kind: 'tcp',
+      title: 'TCP handshake — SYN',
+      real: 'TCP is connection-oriented: both sides agree on sequence numbers before any data is sent, using a three-way handshake.',
+      simp: '—',
+      learn: { what: client.hostname + ' sends SYN (seq=x) to ' + dest.name + ':443.', why: 'TCP needs a reliable, ordered connection before HTTPS can begin.', proto: 'TCP', transport: 'TCP', port: '443', visible: 'SYN flag set; no application data yet.', changes: 'The server will reply with SYN-ACK if it accepts.' },
+      levels: {
+        beginner: 'Your computer says "Hello, can we talk?" to ' + dest.name + '\u2019s server.',
+        intermediate: 'A TCP SYN segment opens the three-way handshake toward ' + dest.name + ':443.',
+        technical: 'TCP SYN, seq=x, MSS/window-scale/SACK options negotiated.'
+      }, path: ['edge', 'server']
+    });
+    push({
+      id: 'tcp-synack', phase: 'TCP handshake', dir: 'resp', proto: 'TCP', kind: 'tcp',
+      title: 'TCP handshake — SYN-ACK',
+      real: 'The server acknowledges the client\u2019s SYN and sends its own sequence number.',
+      simp: '—',
+      learn: { what: 'Server replies SYN-ACK (seq=y, ack=x+1).', why: 'Both directions of the connection are now being set up.', proto: 'TCP', transport: 'TCP', port: '443', visible: 'SYN+ACK flags.', changes: 'The client will send the final ACK.' },
+      levels: {
+        beginner: 'The server answers: "Yes, hello — and I hear you."',
+        intermediate: 'The server responds with SYN-ACK, acknowledging the client\u2019s sequence number and proposing its own.',
+        technical: 'TCP SYN,ACK seq=y ack=x+1.'
+      }, path: ['server', 'edge']
+    });
+    push({
+      id: 'tcp-ack', phase: 'TCP handshake', dir: 'req', proto: 'TCP', kind: 'tcp',
+      title: 'TCP handshake — ACK (connection established)',
+      real: 'The three-way handshake completes; a reliable, ordered TCP connection now exists.',
+      simp: '—',
+      learn: { what: client.hostname + ' sends the final ACK (seq=x+1, ack=y+1).', why: 'This confirms both sides are ready to exchange data.', proto: 'TCP', transport: 'TCP', port: '443', visible: 'ACK flag.', changes: 'TLS negotiation can now begin on top of this TCP connection.' },
+      levels: {
+        beginner: 'Your computer confirms: "Got it — let\u2019s talk." The connection is now open.',
+        intermediate: 'The client sends the final ACK; the TCP connection is ESTABLISHED.',
+        technical: 'TCP ACK seq=x+1 ack=y+1 — connection state moves to ESTABLISHED.'
+      }, path: ['edge', 'server'],
+      action: (st) => { if (st.currentNat) st.nat.setState(st.currentNat, 'ESTABLISHED'); }
+    });
+
+    push({
+      id: 'tls-hello', phase: 'TLS handshake', dir: 'req', proto: 'TLS 1.3', kind: 'tls',
+      title: 'TLS handshake — ClientHello',
+      real: 'TLS negotiates an encrypted channel: supported versions, cipher suites and a client key share.',
+      simp: 'Key values shown are simulated-looking hex, not real cryptographic material.',
+      learn: { what: 'Client sends ClientHello (TLS 1.3, cipher suites, key share, SNI=' + dest.name + ').', why: 'HTTPS requires an encrypted, authenticated channel before any request is sent.', proto: 'TLS 1.3', transport: 'TCP', port: '443', visible: 'The SNI hostname is visible in plaintext even in TLS 1.3; everything after this is encrypted.', changes: 'The server will choose parameters and present a certificate.' },
+      levels: {
+        beginner: 'Your browser and the server start agreeing on a secret code (encryption) so no one else can read your data.',
+        intermediate: 'The browser sends a TLS 1.3 ClientHello proposing cipher suites and a key share, including SNI=' + dest.name + '.',
+        technical: 'ClientHello: TLS 1.3, key_share=' + fakeHex(11, 8) + '…, supported_versions, SNI=' + dest.name + ' (plaintext).'
+      }, path: ['edge', 'server']
+    });
+    push({
+      id: 'tls-server', phase: 'TLS handshake', dir: 'resp', proto: 'TLS 1.3', kind: 'tls',
+      title: 'TLS handshake — ServerHello + Certificate',
+      real: 'The server replies with its chosen parameters, a key share, and a certificate proving its identity.',
+      simp: 'The certificate shown is a simulated placeholder, not a real X.509 chain.',
+      learn: { what: 'Server sends ServerHello, its certificate for ' + dest.name + ', and Finished.', why: 'The certificate lets the browser verify it is really talking to ' + dest.name + '.', proto: 'TLS 1.3', transport: 'TCP', port: '443', visible: 'Certificate is visible; the rest is encrypted from here on.', changes: 'Both sides derive shared session keys.' },
+      levels: {
+        beginner: 'The server proves who it is (like showing an ID card) and finishes setting up the secret code.',
+        intermediate: 'The server answers with ServerHello, its certificate for ' + dest.name + ', and derives session keys.',
+        technical: 'ServerHello + EncryptedExtensions + Certificate(CN=' + dest.name + ') + CertificateVerify + Finished; key_share=' + fakeHex(22, 8) + '…'
+      }, path: ['server', 'edge']
+    });
+    push({
+      id: 'tls-done', phase: 'TLS handshake', dir: 'local', proto: 'TLS 1.3', kind: 'tls',
+      title: 'Encrypted channel established',
+      real: 'From this point, all HTTP traffic on this connection is encrypted end-to-end between browser and server.',
+      simp: '—',
+      learn: { what: 'A symmetric session key is derived on both ends; the TLS handshake completes.', why: 'This keeps the request (including cookies and page content) private from anyone in between.', proto: 'TLS 1.3', transport: 'TCP', port: '443', visible: 'Nothing — traffic content is now opaque to observers.', changes: 'The browser can now send the encrypted HTTPS request.' },
+      levels: {
+        beginner: 'A private, locked tunnel now exists between your browser and the server.',
+        intermediate: 'Both sides have derived matching session keys; the TCP connection is now a secure TLS 1.3 tunnel.',
+        technical: 'Application traffic keys derived (HKDF); all subsequent records are AEAD-encrypted.'
+      }, path: null
+    });
+
+    push({
+      id: 'http-req', phase: 'HTTPS request', dir: 'req', proto: 'HTTP/1.1 (simulated) over TLS', kind: 'http',
+      title: 'Encrypted HTTPS request sent — SIMULATED',
+      real: 'The browser sends an HTTP request (method, path, headers) inside the encrypted TLS channel.',
+      simp: 'Modern browsers often use HTTP/2 or HTTP/3 (QUIC over UDP) instead of plain HTTP/1.1 — simplified here to one illustrative request/response.',
+      learn: { what: 'GET / HTTP/1.1, Host: ' + dest.name + ' — sent as encrypted bytes.', why: 'This is the actual request for the web page.', proto: 'HTTP', transport: 'TCP (TLS-encrypted)', port: '443', visible: 'Only opaque encrypted bytes to any observer on the path.', changes: 'The server will process the request and prepare a response.' },
+      levels: {
+        beginner: 'Your browser asks the server for the ' + dest.name + ' home page — but the request itself is scrambled so only the server can read it.',
+        intermediate: 'An HTTP GET request for "/" is sent inside the encrypted TLS channel to ' + dest.name + '.',
+        technical: 'Encrypted TLS record carrying: GET / HTTP/1.1\\r\\nHost: ' + dest.name + '\\r\\n… (SIMULATED — HTTP/2/3 in real deployments).'
+      }, path: ['edge', 'server']
+    });
+    push({
+      id: 'server-proc', phase: dest.name + ' server', dir: 'local', proto: 'HTTP', kind: 'server',
+      title: dest.name + '\u2019s server processes the request',
+      real: 'A web server reads the request, runs any application logic, and builds a response with a status code.',
+      simp: 'A single simulated server stands in for load balancers, application servers and databases.',
+      learn: { what: 'The server on port 443 builds an HTTP 200 OK response with the page content.', why: 'This is where the actual page you asked for gets assembled.', proto: 'HTTP', transport: 'TCP (TLS)', port: '443', visible: 'Server-side only — not visible on the network.', changes: 'A response is now ready to send back the way the request came.' },
+      levels: {
+        beginner: dest.name + '\u2019s computer puts together the web page you asked for.',
+        intermediate: 'The server processes the GET request and prepares an HTTP 200 OK response containing the page.',
+        technical: 'Server-side handler executes, response assembled: HTTP/1.1 200 OK, Content-Type: text/html.'
+      }, path: null
+    });
+
+    push({
+      id: 'resp-start', phase: 'Response', dir: 'resp', proto: '—', kind: 'resp-banner',
+      title: 'RESPONSE STARTS HERE',
+      real: 'From here, every hop is retraced in reverse — the response must arrive back at the exact computer that asked, not any other.',
+      simp: '—',
+      learn: { what: 'The server\u2019s answer begins its journey back across the same network path.', why: 'TCP/IP is connection-based — the reply is routed back using the addresses recorded when the request went out.', proto: '—', transport: '—', port: '—', visible: '—', changes: 'Direction reverses for every remaining step.' },
+      levels: {
+        beginner: 'Now the answer has to travel all the way back to your computer.',
+        intermediate: 'The HTTP response now retraces the request\u2019s path in reverse, hop by hop.',
+        technical: 'Reverse path: server → edge → backbone → ISP → NAT → gateway → ' + (isWifi ? 'Wi-Fi' : 'radio') + ' → client, using the state recorded by NAT/ARP/routing along the way.'
+      }, path: null
+    });
+
+    push({
+      id: 'http-resp', phase: 'Response', dir: 'resp', proto: 'HTTP over TLS', kind: 'http',
+      title: 'Encrypted HTTPS response — SIMULATED',
+      real: 'The response (HTML/CSS/JS/images) travels back inside the same encrypted TLS channel.',
+      simp: 'Real pages involve many additional requests for images, scripts and stylesheets — simplified to one response.',
+      learn: { what: 'HTTP/1.1 200 OK with page content, encrypted, sent from server to edge.', why: 'This is the data your browser will render.', proto: 'HTTP', transport: 'TCP (TLS)', port: '443', visible: 'Opaque encrypted bytes only.', changes: 'The response now heads back across the Internet toward your ISP.' },
+      levels: {
+        beginner: dest.name + ' sends the web page back, still scrambled for privacy.',
+        intermediate: 'The 200 OK response is sent from the server back through the edge, encrypted end-to-end.',
+        technical: 'Encrypted TLS records carrying HTTP/1.1 200 OK + body begin the return trip.'
+      }, path: ['server', 'edge']
+    });
+    push({
+      id: 'resp-backbone', phase: 'Response', dir: 'resp', proto: 'IPv4', kind: 'packet',
+      title: 'Response crosses the backbone (R4 → R1)',
+      real: 'The reverse path is not necessarily identical to the forward path in the real Internet — routing can be asymmetric.',
+      simp: 'This simulation retraces the same simulated routers for clarity.',
+      learn: { what: 'The response packet is forwarded backward across R4 → R1.', why: 'Each backbone router forwards based on its own table, just like on the way out.', proto: 'IPv4', transport: 'TCP', port: String(443), visible: 'TTL, source/destination IP.', changes: '—' },
+      levels: {
+        beginner: 'The reply travels back across the Internet, the same way the request went out.',
+        intermediate: 'The response is forwarded back across the simulated backbone routers toward your ISP.',
+        technical: 'Reverse-direction forwarding across r4→r3→r2→r1 (real-world return paths can differ from the outbound path — asymmetric routing).'
+      }, path: ['edge', 'r4', 'r3', 'r2', 'r1']
+    });
+    ispChain.slice().reverse().forEach(([from, to, label], i) => {
+      push({
+        id: 'resp-isp-' + i, phase: 'Response', dir: 'resp', proto: 'IPv4', kind: 'packet',
+        title: 'Response reaches the ' + label,
+        real: 'The ISP forwards the reply toward the customer connection it came from.',
+        simp: '—',
+        learn: { what: 'Forwarded from ' + net.nodes[to].name + ' back to ' + net.nodes[from].name + '.', why: 'Getting back to your home network also takes several hops.', proto: 'IPv4', transport: 'TCP', port: '443', visible: 'TTL, addressing.', changes: '—' },
+        levels: {
+          beginner: 'The reply moves back through your Internet provider\u2019s network.',
+          intermediate: 'The ISP forwards the response from ' + net.nodes[to].name + ' to ' + net.nodes[from].name + '.',
+          technical: 'Reverse hop-by-hop forwarding inside AS64500 toward the customer edge.'
+        }, path: [to, from]
+      });
+    });
+
+    push({
+      id: 'nat-resp', phase: 'NAT', dir: 'resp', proto: 'NAT', kind: 'nat-resp',
+      title: NATNAME + ' looks up the NAT table',
+      real: 'The router checks its NAT table by (protocol, public port) to find out which internal computer originally made this connection.',
+      simp: 'This is exactly why the earlier NAT table row matters — without it, the router would not know which of the five PCs should get the reply.',
+      learn: { what: NATNAME + ' matches the incoming reply\u2019s destination port against its NAT table and finds ' + client.hostname + '.', why: 'This is the single most important reason NAT works: only the PC that opened the connection gets the reply.', proto: 'NAT', transport: 'TCP', port: 'public port → private port', visible: 'The NAT table row used for this lookup.', changes: 'The destination address is rewritten from the public IP back to ' + client.ip + '.' },
+      levels: {
+        beginner: 'The router checks its notebook: "Which computer asked for this?" — and finds ' + client.hostname + ', not any of the other computers.',
+        intermediate: NATNAME + ' looks up its NAT table by the destination public port, finds the mapping to ' + client.ip + ', and rewrites the destination address.',
+        technical: 'Reverse NAT lookup keyed on (dstPort=public port, proto=TCP) → internal (' + client.ip + ', ephemeral port); destination rewritten accordingly.'
+      }, path: null,
+      action: (st) => { if (st.currentNat) st.currentNat.state = 'ESTABLISHED'; }
+    });
+
+    push({
+      id: 'to-client', phase: 'Local delivery', dir: 'resp', proto: isWifi ? 'Wi-Fi' : 'Radio', kind: 'delivery',
+      title: 'Response delivered to ' + client.hostname + (isWifi ? ' — other computers stay dark' : ''),
+      real: isWifi ? 'The switch/AP forwards the frame only to the port/MAC address of ' + client.hostname + '; the other four computers never see this traffic.' : 'The mobile core delivers the packet through the specific tunnel belonging to this phone\u2019s session.',
+      simp: '—',
+      learn: { what: 'The frame is delivered to ' + client.mac + ' (' + client.hostname + ') specifically.', why: isWifi ? 'Switches (and Wi-Fi APs) forward by destination MAC, so only the addressed device receives the frame.' : 'Each subscriber has its own tunnel, so traffic cannot cross between phones.', proto: isWifi ? 'Ethernet/Wi-Fi' : 'Cellular', transport: 'TCP', port: '443', visible: 'Destination MAC = ' + client.mac + '.', changes: 'Delivery to the correct device is complete.' },
+      levels: {
+        beginner: 'The reply arrives back at exactly your computer — none of the other computers on the network ever saw it.',
+        intermediate: 'The ' + L2NAME + ' delivers the frame using the destination MAC/tunnel that belongs only to ' + client.hostname + '.',
+        technical: isWifi ? 'Switch forwards to the port associated with dst MAC ' + client.mac + ' (learned earlier in the switch table) — no flooding needed.' : 'Delivery via the subscriber-specific GTP-U tunnel established for this session.'
+      }, path: [r.gw, r.l2, r.client]
+    });
+
+    push({
+      id: 'render', phase: 'Browser', dir: 'local', proto: 'HTML/CSS/JS', kind: 'render',
+      title: 'Browser decrypts, parses and renders the page',
+      real: 'The browser decrypts the TLS record, parses the HTTP response and HTML, then builds and paints the page.',
+      simp: 'Real rendering involves additional requests for images/CSS/JS; simplified to one page load.',
+      learn: { what: 'The TLS layer decrypts the bytes, HTTP parses headers/body, and the rendering engine builds the page.', why: 'This is the final step that turns network bytes into what you see on screen.', proto: 'HTML/CSS/JS', transport: '—', port: '—', visible: 'Nothing further leaves the network — this is entirely local.', changes: 'The requested page is now visible.' },
+      levels: {
+        beginner: 'Your browser unlocks, reads and displays the page for you.',
+        intermediate: 'The browser decrypts the TLS session, parses the HTTP response, and renders the HTML/CSS/JS.',
+        technical: 'TLS record decryption → HTTP response parsing → DOM construction → CSSOM → render tree → paint.'
+      }, path: null
+    });
+
+    push({
+      id: 'done', phase: 'Complete', dir: 'local', proto: '—', kind: 'done',
+      title: '🎉 GOOGLE PAGE LOADED',
+      real: 'This full journey — DNS, ' + (isWifi ? 'ARP, ' : '') + 'NAT, routing, TCP, TLS and HTTP — happens in a few hundred milliseconds on a real connection.',
+      simp: 'This simulator strips out load-balancing, CDNs, HTTP/2+/QUIC, caching, retries and much more to keep the concepts visible.',
+      learn: { what: 'The page finished loading.', why: 'You just walked through the entire path a real request takes.', proto: '—', transport: '—', port: '—', visible: '—', changes: '—' },
+      levels: {
+        beginner: 'All done! That is everything that happens, at a simplified level, between typing an address and seeing a page.',
+        intermediate: 'The journey is complete — you have now traced a request through every major layer of the stack.',
+        technical: 'End-to-end path traced: application → DNS → (ARP) → NAT → routing → BGP/AS path → TCP → TLS 1.3 → HTTP, and the mirrored return path.'
+      }, path: null
+    });
+
+    return S;
+  }
+
+  /* ------------------------------------------------------------------------
+   * 5. Failure lab — each scenario interrupts the normal journey at a named
+   *    stage and replaces the rest of the plan with a single explanation step.
+   * ---------------------------------------------------------------------- */
+  function failureScenarios(state) {
+    const dest = state.dest, net = state.net, client = net.nodes[net.roles.client];
+    const lossSel = document.getElementById('lab-loss');
+    const lossStage = lossSel && lossSel.value ? state.stages.find((s) => s.id === lossSel.value) : null;
+    const lossLabel = lossStage ? lossStage.title : 'A packet on the path';
+    return [
+      {
+        id: 'dns-fail', label: 'DNS failure', breakAt: 'dns-q',
+        why: 'The resolver ' + client.dns + ' does not answer (or the domain does not exist).',
+        explain: 'Without a DNS answer, the browser never learns an IP address for "' + dest.name + '" and cannot open any connection. This is why browsers show "DNS_PROBE_FINISHED_NXDOMAIN" or similar errors — everything downstream (ARP, NAT, TCP, TLS) never gets a chance to run.'
+      },
+      {
+        id: 'gw-fail', label: 'Router / gateway failure', breakAt: 'route',
+        why: net.nodes[net.roles.gw].name + ' is offline or unreachable.',
+        explain: 'With the default gateway down, the computer has no way to leave the local network at all — it can still talk to other devices on the same Wi-Fi/LAN, but every packet addressed outside it is dropped locally. DNS, NAT, and everything beyond never happen.'
+      },
+      {
+        id: 'nat-fail', label: 'NAT mapping failure', breakAt: 'nat-resp',
+        why: 'The NAT table entry expired or was never created (e.g. a firewall blocked outbound TCP).',
+        explain: 'If ' + net.nodes[net.roles.nat].name + ' has no matching NAT entry when the reply arrives, it has no way to know which internal computer should receive it — the reply is dropped. This is exactly why the NAT table matters: no entry means no delivery, even though the server answered correctly.'
+      },
+      {
+        id: 'loss', label: 'Packet loss + retransmission', breakAt: 'tcp-syn',
+        why: lossLabel + ' is silently dropped somewhere on the path.',
+        explain: 'TCP does not know a packet was lost until an acknowledgement fails to arrive in time. After a retransmission timeout (RTO), the sender resends the same segment. A couple of lost packets just adds latency; sustained loss can stall or fail the connection.'
+      },
+      {
+        id: 'tcp-timeout', label: 'TCP timeout', breakAt: 'tcp-synack',
+        why: dest.name + '\u2019s server (or something on the path) never sends SYN-ACK.',
+        explain: 'The client resends SYN a few times with increasing backoff, then gives up — the browser shows a "connection timed out" error. No TLS or HTTP ever happens because the transport layer connection was never established.'
+      },
+      {
+        id: 'tls-fail', label: 'TLS certificate failure', breakAt: 'tls-server',
+        why: 'The certificate presented does not match ' + dest.name + ' (expired, wrong domain, or untrusted issuer).',
+        explain: 'The browser refuses to proceed and shows a certificate-warning page. This check exists specifically to stop attackers from impersonating a site — the TCP connection is open, but no data is exchanged over it because trust could not be established.'
+      }
+    ];
+  }
+
+  /* ------------------------------------------------------------------------
+   * 6. Renderers — SVG topology + device info
+   * ---------------------------------------------------------------------- */
+  function renderClientOptions(state) {
+    const sel = $('#sel-client');
+    clear(sel);
+    if (state.mode === 'wifi') {
+      for (let i = 1; i <= 5; i++) {
+        sel.appendChild(el('option', { value: 'pc' + i }, 'PC' + i + ' — 192.168.1.' + (19 + i)));
+      }
+      sel.value = state.clientId && state.clientId.indexOf('pc') === 0 ? state.clientId : 'pc3';
+    } else {
+      sel.appendChild(el('option', { value: 'phone' }, 'Phone — 100.72.14.9'));
+      sel.value = 'phone';
+    }
+  }
+
+  function nodeColor(n) {
+    if (n.type === 'computer') return 'computer';
+    if (n.type === 'switch' || n.type === 'tower') return 'switch';
+    if (n.type === 'router' || n.type === 'core' || n.type === 'cgnat') return 'router';
+    if (n.type === 'isp') return 'isp';
+    if (n.type === 'internet') return 'internet';
+    if (n.type === 'edge' || n.type === 'server') return 'dest';
+    return 'node';
+  }
+
+  function renderTopology(state) {
+    const net = state.net;
+    const svgRoot = $('#topo-svg');
+    clear(svgRoot);
+    svgRoot.setAttribute('viewBox', '0 0 ' + net.width + ' ' + net.height);
+
+    // Band backgrounds (AS regions)
+    net.bands.forEach((b) => {
+      const x1 = net.layout[b.from].x - 45, x2 = net.layout[b.to].x + 45;
+      svgRoot.appendChild(svg('rect', { x: x1, y: 30, width: x2 - x1, height: net.height - 60, class: 'band band-' + b.key, rx: 14 }));
+      svgRoot.appendChild(svg('text', { x: (x1 + x2) / 2, y: 22, class: 'band-label', 'text-anchor': 'middle' }, b.label));
+    });
+    // Group boxes (home router, ISP, internet path, dest)
+    net.groups.forEach((g) => {
+      const xs = g.ids.map((id) => net.layout[id].x);
+      const x1 = Math.min(...xs) - 40, x2 = Math.max(...xs) + 40;
+      svgRoot.appendChild(svg('rect', { x: x1, y: 60, width: x2 - x1, height: net.height - 120, class: 'group group-' + g.cls, rx: 12 }));
+      svgRoot.appendChild(svg('text', { x: (x1 + x2) / 2, y: net.height - 40, class: 'group-label', 'text-anchor': 'middle' }, g.label));
+    });
+    // Links
+    net.links.forEach((l) => {
+      const a = net.layout[l.a], b = net.layout[l.b];
+      if (!a || !b) return;
+      svgRoot.appendChild(svg('line', {
+        x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+        class: 'link link-' + l.kind + (l.kind === 'wifi' || l.kind === 'radio' ? ' dashed' : '')
+      }));
+    });
+    // Nodes
+    Object.keys(net.nodes).forEach((id) => {
+      const n = net.nodes[id]; const pos = net.layout[id];
+      const isClient = id === net.roles.client;
+      const isOtherPc = n.type === 'computer' && !isClient;
+      const g = svg('g', { class: 'node node-' + nodeColor(n) + (isOtherPc ? ' dim' : '') + (n.status === 'offline' ? ' offline' : ''), tabindex: '0', role: 'button', 'aria-label': n.name + ' — ' + (n.sub || ''), 'data-id': id });
+      g.appendChild(svg('circle', { cx: pos.x, cy: pos.y, r: n.type === 'computer' ? 22 : 26, class: 'node-circle' }));
+      g.appendChild(svg('text', { x: pos.x, y: pos.y + 7, class: 'node-icon', 'text-anchor': 'middle' }, n.icon));
+      g.appendChild(svg('text', { x: pos.x, y: pos.y + (n.type === 'computer' ? 40 : 46), class: 'node-name', 'text-anchor': 'middle' }, n.name));
+      if (n.sub) g.appendChild(svg('text', { x: pos.x, y: pos.y + (n.type === 'computer' ? 53 : 59), class: 'node-sub mono', 'text-anchor': 'middle' }, n.sub));
+      g.addEventListener('click', () => { selectNode(state, id); });
+      g.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectNode(state, id); } });
+      svgRoot.appendChild(g);
+    });
+  }
+
+  function selectNode(state, id) {
+    state.selectedNode = id;
+    renderNodeInfo(state, id);
+    renderRoutingTable(state, id);
+    $$('.node', $('#topo-svg')).forEach((g) => g.classList.toggle('selected', g.getAttribute('data-id') === id));
+  }
+
+  function renderNodeInfo(state, id) {
+    const box = $('#node-info');
+    clear(box);
+    const n = state.net.nodes[id];
+    if (!n) { box.appendChild(el('p', { class: 'muted' }, 'Click any device on the map to inspect it.')); return; }
+    const rows = [];
+    rows.push(['Name', n.name]);
+    if (n.hostname) rows.push(['Hostname', n.hostname]);
+    if (n.ip) rows.push(['IPv4 address', n.ip]);
+    if (n.wanIp) rows.push(['Public (WAN) IP', n.wanIp]);
+    if (n.subnet) rows.push(['Subnet', n.subnet]);
+    if (n.mac) rows.push(['MAC address', n.mac]);
+    if (n.macs) { rows.push(['LAN MAC', n.macs.lan]); rows.push(['WAN MAC', n.macs.wan]); }
+    if (n.gateway) rows.push(['Default gateway', n.gateway]);
+    if (n.dns) rows.push(['DNS server', n.dns]);
+    if (n.connection) rows.push(['Connection type', n.connection]);
+    if (n.as) rows.push(['Autonomous System', 'AS' + n.as]);
+    if (n.lease) rows.push(['Lease / session', n.lease]);
+    const dl = el('dl', { class: 'kv mono' });
+    rows.forEach(([k, v]) => { dl.appendChild(el('dt', {}, k)); dl.appendChild(el('dd', {}, String(v))); });
+    box.appendChild(el('h3', {}, n.icon + ' ' + n.name));
+    box.appendChild(dl);
+    if (n.role) box.appendChild(el('p', { class: 'hint' }, n.role));
+  }
+
+  /* ---- Step / learning panel, progress, phases, log, browser -------------- */
+  function renderStepPanel(state, stage) {
+    setText($('#step-dir'), stage.dir === 'req' ? '▶ REQUEST' : stage.dir === 'resp' ? '◀ RESPONSE' : '◆ LOCAL / BACKGROUND');
+    $('#step-dir').className = 'step-dir ' + stage.dir;
+    setText($('#step-caption'), stage.title);
+    setText($('#step-text'), stage.levels[state.level] || stage.levels.beginner);
+    setText($('#step-real'), stage.real || '—');
+    setText($('#step-simp'), stage.simp || '—');
+    const learnBox = $('#learn-box');
+    if (state.learning) {
+      learnBox.hidden = false;
+      setText($('#learn-what'), stage.learn.what);
+      setText($('#learn-why'), stage.learn.why);
+      setText($('#learn-proto'), stage.learn.proto);
+      setText($('#learn-transport'), stage.learn.transport);
+      setText($('#learn-port'), stage.learn.port);
+      setText($('#learn-visible'), stage.learn.visible);
+      setText($('#learn-changes'), stage.learn.changes);
+    } else learnBox.hidden = true;
+    setText($('#sr-status'), stage.title + '. ' + (stage.levels[state.level] || ''));
+
+    $('#dir-req').classList.toggle('active', stage.dir === 'req');
+    $('#dir-resp').classList.toggle('active', stage.dir === 'resp');
+    $('#dir-local').classList.toggle('active', stage.dir === 'local');
+    $('#banner-resp').hidden = stage.kind !== 'resp-banner';
+  }
+
+  function renderProgress(state) {
+    const total = state.stages.length;
+    const idx = state.stageIndex + 1;
+    setText($('#step-count'), 'Step ' + Math.max(0, idx) + ' / ' + total);
+    setText($('#step-title'), state.stageIndex >= 0 ? state.stages[state.stageIndex].title : 'Ready — press Start or Next Step');
+    const pct = total ? Math.round((idx / total) * 100) : 0;
+    $('#progress').setAttribute('aria-valuenow', String(pct));
+    $('#bar-fill').style.width = pct + '%';
+    const blocks = 20, filled = Math.round((pct / 100) * blocks);
+    setText($('#blockbar'), '█'.repeat(filled) + '░'.repeat(blocks - filled));
+  }
+
+  function renderPhaseStrip(state) {
+    const strip = $('#phase-strip');
+    clear(strip);
+    const phases = [];
+    state.stages.forEach((s) => { if (!phases.length || phases[phases.length - 1].name !== s.phase) phases.push({ name: s.phase, firstIdx: state.stages.indexOf(s) }); });
+    phases.forEach((p) => {
+      const active = state.stageIndex >= p.firstIdx;
+      const current = state.stageIndex >= 0 && state.stages[state.stageIndex].phase === p.name;
+      strip.appendChild(el('li', { class: 'phase' + (active ? ' done' : '') + (current ? ' current' : '') }, p.name));
+    });
+  }
+
+  function appendLog(state, text) {
+    const log = $('#log');
+    const row = el('div', { class: 'log-row' }, [
+      el('span', { class: 'mono log-time' }, fmtClock(Date.now())),
+      el('span', {}, text)
+    ]);
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function renderBrowser(state, stage) {
+    const dest = state.dest;
+    $('#b-tab').textContent = (stage && stage.id === 'start') || state.stageIndex < 0 ? 'New tab' : dest.name;
+    $('#b-url').textContent = state.stageIndex < 0 ? 'Type a website below' : (state.stageIndex >= state.stages.findIndex((s) => s.id === 'tls-done') ? 'https://' + dest.name : dest.name + ' — connecting…');
+    $('#b-lock').textContent = state.stageIndex >= state.stages.findIndex((s) => s.id === 'tls-done') ? '🔒' : '🔎';
+    const view = $('#b-view');
+    clear(view);
+    const doneIdx = state.stages.findIndex((s) => s.id === 'render');
+    if (state.stageIndex >= 0 && doneIdx >= 0 && state.stageIndex >= doneIdx) {
+      view.appendChild(el('div', { class: 'rendered-page' }, [
+        el('div', { class: 'rp-logo' }, dest.real ? '🔎 ' + dest.name : '🌍 ' + dest.name),
+        el('div', { class: 'rp-bar' }),
+        el('div', { class: 'rp-line' }), el('div', { class: 'rp-line short' })
+      ]));
+      $('#b-status').textContent = 'Done';
+    } else if (state.stageIndex >= 0) {
+      view.appendChild(el('p', { class: 'muted' }, 'Loading ' + dest.name + '…'));
+      $('#b-status').textContent = stage ? stage.title : 'Connecting…';
+    } else {
+      $('#b-status').textContent = 'Ready';
+    }
+  }
+
+  /* ---- NAT / DNS / ARP / routing table panels ------------------------------ */
+  function renderNat(state) {
+    const body = $('#nat-body');
+    clear(body);
+    state.nat.table.forEach((e) => {
+      body.appendChild(el('tr', { class: e.pcId === state.clientId ? 'row-active' : '' }, [
+        el('td', {}, e.internalIp + ':' + e.internalPort + ' (' + e.pcName + ')'),
+        el('td', {}, state.net.nodes[state.net.roles.nat].wanIp + ':' + e.publicPort),
+        el('td', {}, e.remoteIp + ':' + e.remotePort),
+        el('td', {}, e.state)
+      ]));
+    });
+    setText($('#nat-note'), state.nat.table.length
+      ? 'Each row maps one internal (private) address+port to one public address+port. A reply is only delivered to the PC whose row matches.'
+      : 'No NAT sessions yet — start the simulation to create one.');
+  }
+
+  function renderNatDemo(state) {
+    const box = $('#nat-clients');
+    clear(box);
+    if (state.mode !== 'wifi') { box.appendChild(el('p', { class: 'muted' }, 'The five-PC demo applies to Wi-Fi mode.')); return; }
+    for (let i = 1; i <= 5; i++) {
+      const id = 'pc' + i;
+      const checked = state.natDemo.has(id);
+      const label = el('label', { class: 'check' }, [
+        el('input', { type: 'checkbox', checked: checked, onchange: (e) => {
+          if (e.target.checked) state.natDemo.add(id); else state.natDemo.delete(id);
+          applyNatDemo(state);
+        } }),
+        el('span', {}, 'PC' + i + (id === state.clientId ? ' (selected)' : ''))
+      ]);
+      box.appendChild(label);
+    }
+  }
+
+  function applyNatDemo(state) {
+    const net = state.net;
+    state.natDemo.forEach((id) => {
+      const n = net.nodes[id];
+      if (n) state.nat.allocate(id, n.name, n.ip, state.dest.ip, 443, 'TCP');
+    });
+    // remove entries for pcs turned off (except the active client's own session)
+    for (let i = state.nat.table.length - 1; i >= 0; i--) {
+      const e = state.nat.table[i];
+      if (e.pcId !== state.clientId && !state.natDemo.has(e.pcId)) state.nat.table.splice(i, 1);
+    }
+    renderNat(state);
+  }
+
+  function renderDns(state) {
+    setText($('#dns-query'), state.dnsQuery ? ('; QUESTION\n' + state.dnsQuery.name + '.  IN  ' + state.dnsQuery.type) : '—');
+    const rec = state.dns.lookup(state.dest.name, 'A');
+    setText($('#dns-response'), rec ? (state.dest.name + '.  ' + rec.ttl + '  IN  A  ' + rec.value) : '—');
+    const chain = $('#dns-chain'); clear(chain);
+    ['Browser / OS cache — checked first', 'Recursive resolver (' + (state.net.nodes[state.net.roles.client].dns) + ') — checked next', 'Root → .com → authoritative (simulated as one step)', 'Answer cached locally with its TTL'].forEach((t) => chain.appendChild(el('li', {}, t)));
+    const cacheBody = $('#dns-cache'); clear(cacheBody);
+    state.dns.rows().forEach((r) => cacheBody.appendChild(el('tr', {}, [el('td', {}, r.name), el('td', {}, r.type), el('td', {}, r.value), el('td', {}, String(r.ttl))])));
+  }
+
+  function renderArp(state) {
+    const client = state.net.nodes[state.net.roles.client];
+    if (state.mode !== 'wifi') {
+      setText($('#arp-msg'), 'Mobile data has no ARP — the phone talks to the mobile core over a radio tunnel, not a shared Ethernet/Wi-Fi segment.');
+    } else {
+      const mac = state.arp.resolve(client.gateway);
+      setText($('#arp-msg'), mac ? ('who-has ' + client.gateway + '?  ' + client.gateway + ' is-at ' + mac) : 'who-has ' + client.gateway + '?  (no reply yet)');
+    }
+    const cacheBody = $('#arp-cache'); clear(cacheBody);
+    state.arp.cache.forEach((mac, ip) => cacheBody.appendChild(el('tr', {}, [el('td', {}, ip), el('td', {}, mac)])));
+    const swBody = $('#sw-body'); clear(swBody);
+    state.arp.switchTable.forEach((port, mac) => swBody.appendChild(el('tr', {}, [el('td', {}, mac), el('td', {}, String(port))])));
+  }
+
+  function renderRoutingTable(state, nodeId) {
+    const n = state.net.nodes[nodeId || state.selectedNode];
+    const body = $('#rt-body'); clear(body);
+    if (!n || !n.routingTable || !n.routingTable.length) {
+      setText($('#rt-title'), n ? n.name + ' has no routing table (not a router).' : 'Click a router on the map, or Next Step to follow the packet.');
+      setText($('#rt-info'), '');
+      return;
+    }
+    setText($('#rt-title'), n.name + (n.as ? ' · AS' + n.as : ''));
+    n.routingTable.forEach((r) => body.appendChild(el('tr', {}, [el('td', {}, r.dest), el('td', {}, r.next), el('td', {}, r.iface), el('td', {}, r.as)])));
+    setText($('#rt-info'), 'Longest matching prefix wins. A default route (0.0.0.0/0) only matches when nothing more specific does.');
+  }
+
+  /* ---- Packet inspector ------------------------------------------------- */
+  const LAYERS = ['Link (L2)', 'Internet (L3)', 'Transport (L4)', 'Application (L7)'];
+
+  function renderInspectorSelect(state) {
+    const sel = $('#insp-select');
+    clear(sel);
+    if (!state.packets.length) { sel.appendChild(el('option', { value: '' }, 'No packets yet')); return; }
+    state.packets.forEach((p) => {
+      sel.appendChild(el('option', { value: p.id, selected: p.id === (state.currentPacket && state.currentPacket.id) }, p.kind + ' · ' + p.id));
+    });
+  }
+
+  function renderLayerButtons(state) {
+    const box = $('#layer-buttons'); clear(box);
+    LAYERS.forEach((name, i) => {
+      box.appendChild(el('button', {
+        type: 'button', class: 'seg' + (state.layerFilter === i ? ' on' : ''), 'aria-pressed': state.layerFilter === i,
+        onclick: () => { state.layerFilter = state.layerFilter === i ? -1 : i; renderInspector(state); }
+      }, name));
+    });
+  }
+
+  function renderInspector(state) {
+    renderInspectorSelect(state);
+    renderLayerButtons(state);
+    const pkt = state.currentPacket;
+    const lifeBox = $('#insp-life'); clear(lifeBox);
+    const secBox = $('#insp-sections'); clear(secBox);
+    const natBox = $('#insp-nat'); natBox.hidden = true; clear(natBox);
+    if (!pkt) { setText($('#insp-title'), 'Click a packet on the map, or pick one above.'); setText($('#insp-hop'), '—'); return; }
+
+    const life = ['CREATED', 'ENCAPSULATED', 'SENT', 'ROUTED', pkt.natEntry ? 'NAT TRANSLATED' : null, 'FORWARDED', 'RECEIVED', 'DECAPSULATED'].filter(Boolean);
+    life.forEach((s) => lifeBox.appendChild(el('li', {}, s)));
+
+    const path = pkt.path && pkt.path.length ? pkt.path : [state.net.roles.client];
+    if (!pkt.hopIndex) pkt.hopIndex = 0;
+    pkt.hopIndex = clamp(pkt.hopIndex, 0, Math.max(0, path.length - 2));
+    const a = path[pkt.hopIndex], b = path[Math.min(pkt.hopIndex + 1, path.length - 1)];
+    setText($('#insp-hop'), path.length > 1 ? (state.net.nodes[a].name + ' → ' + state.net.nodes[b].name) : state.net.nodes[a].name);
+    setText($('#insp-title'), pkt.kind + ' · ' + pkt.dir.toUpperCase() + ' · id ' + pkt.id);
+
+    const f = path.length > 1 ? fieldsAtHop(state, pkt, a, b) : { srcMac: localMac(state, a), dstMac: '—', srcIp: pkt.srcIp, dstIp: pkt.dstIp, srcPort: pkt.srcPort, dstPort: pkt.dstPort, ttl: pkt.ttlStart };
+
+    function section(title, rows, layerIdx) {
+      if (state.layerFilter >= 0 && state.layerFilter !== layerIdx) return;
+      const box = el('div', { class: 'insp-section' }, [el('h4', {}, title)]);
+      const dl = el('dl', { class: 'kv mono' });
+      rows.forEach(([k, v, changed]) => { dl.appendChild(el('dt', {}, k)); dl.appendChild(el('dd', { class: changed ? 'changed' : '' }, String(v) + (changed ? ' ✱' : ''))); });
+      box.appendChild(dl);
+      secBox.appendChild(box);
+    }
+    section('Layer 2 — Ethernet/Wi-Fi', [['Source MAC', f.srcMac], ['Destination MAC', f.dstMac, true]], 0);
+    section('Layer 3 — IPv4', [['Source IP', f.srcIp || '—'], ['Destination IP', f.dstIp || '—'], ['TTL', f.ttl]], 1);
+    if (pkt.transport && pkt.transport !== 'ARP' && pkt.transport !== '—') {
+      section('Layer 4 — ' + pkt.transport, [['Source port', f.srcPort || '—'], ['Destination port', f.dstPort || '—'], ['Protocol', pkt.proto]], 2);
+    }
+    if (pkt.payload) section('Layer 7 — Application', [['Content', pkt.payload]], 3);
+
+    if (pkt.natEntry) {
+      natBox.hidden = false;
+      natBox.appendChild(el('p', { class: 'mono' }, 'NAT: ' + pkt.natEntry.internalIp + ':' + pkt.natEntry.internalPort + ' ⇄ ' + state.net.nodes[state.net.roles.nat].wanIp + ':' + pkt.natEntry.publicPort));
+    }
+  }
+
+  /* ---- Encapsulation panel ------------------------------------------------ */
+  const ENCAP_LAYERS = [
+    { name: 'Application data', desc: 'The raw HTTP request/response content.' },
+    { name: 'TCP segment', desc: 'Adds source/destination ports and sequence numbers.' },
+    { name: 'IP packet', desc: 'Adds source/destination IP addresses and TTL.' },
+    { name: 'Ethernet / Wi-Fi frame', desc: 'Adds source/destination MAC addresses for the current hop.' }
+  ];
+  function renderEncap(state) {
+    const box = $('#encap-visual'); clear(box);
+    const order = state.encapDir === 'send' ? ENCAP_LAYERS : ENCAP_LAYERS.slice().reverse();
+    order.forEach((layer, i) => {
+      const idx = ENCAP_LAYERS.indexOf(layer);
+      box.appendChild(el('div', { class: 'encap-layer depth-' + i + (idx === state.encapIdx ? ' active' : '') }, layer.name));
+    });
+    const current = ENCAP_LAYERS[state.encapIdx];
+    setText($('#encap-desc'), (state.encapDir === 'send' ? 'Sending (wrapping): ' : 'Receiving (unwrapping): ') + current.desc);
+    $('#encap-send').classList.toggle('on', state.encapDir === 'send');
+    $('#encap-send').setAttribute('aria-pressed', String(state.encapDir === 'send'));
+    $('#encap-recv').classList.toggle('on', state.encapDir === 'recv');
+    $('#encap-recv').setAttribute('aria-pressed', String(state.encapDir === 'recv'));
+  }
+
+  /* ---- BGP diagram, comparison table, failure lab list, realism notes, summary ---- */
+  function renderBgp(state) {
+    const dest = state.dest;
+    const box = $('#bgp-diagram'); clear(box);
+    const ases = [
+      { id: 'AS64500', name: 'Your ISP' },
+      { id: 'AS64501', name: 'Transit network' },
+      { id: 'AS' + dest.as, name: dest.asName }
+    ];
+    const row = el('div', { class: 'bgp-row' });
+    ases.forEach((a, i) => {
+      row.appendChild(el('div', { class: 'bgp-as' }, [el('strong', {}, a.id), el('span', {}, a.name)]));
+      if (i < ases.length - 1) row.appendChild(el('div', { class: 'bgp-arrow' }, '⇄'));
+    });
+    box.appendChild(row);
+    setText($('#bgp-text'), 'Simulated AS path: 64500 → 64501 → ' + dest.as + '. This is a static illustration, not a live BGP routing table — real paths depend on peering agreements and policy that can change at any time.');
+  }
+
+  function renderCompare(state) {
+    const table = $('#compare-table'); clear(table);
+    const rows = [
+      ['First hop', 'Wi-Fi access point', 'Cell tower (radio)'],
+      ['Local addressing', 'ARP (IP → MAC) on a shared LAN', 'No ARP — per-subscriber GTP-U tunnel'],
+      ['Gateway', 'Home router', 'Mobile core (packet gateway)'],
+      ['NAT', 'One home router, few devices per public IP', 'Carrier-grade NAT (CGNAT), thousands of devices per public IP'],
+      ['Typical latency', 'Lower, more stable', 'Higher, more variable'],
+      ['IP address stability', 'Usually stable while connected', 'Can change between towers/cells']
+    ];
+    const thead = el('thead', {}, el('tr', {}, [
+      el('th', { scope: 'col' }, 'Aspect'),
+      el('th', { scope: 'col', tabindex: 0, role: 'button', class: state.mode === 'wifi' ? 'colsel' : '', onclick: () => setModeAndRebuild(state, 'wifi') }, '📶 Wi-Fi'),
+      el('th', { scope: 'col', tabindex: 0, role: 'button', class: state.mode === 'mobile' ? 'colsel' : '', onclick: () => setModeAndRebuild(state, 'mobile') }, '📱 Mobile data')
+    ]));
+    table.appendChild(thead);
+    const tbody = el('tbody');
+    rows.forEach((r) => tbody.appendChild(el('tr', {}, r.map((c, i) => el(i === 0 ? 'th' : 'td', i === 0 ? { scope: 'row' } : {}, c)))));
+    table.appendChild(tbody);
+  }
+
+  function renderLabList(state) {
+    const lossSel = $('#lab-loss'); clear(lossSel);
+    state.stages.forEach((s) => { if (s.dir !== 'local') lossSel.appendChild(el('option', { value: s.id }, s.title)); });
+    const list = $('#lab-list'); clear(list);
+    failureScenarios(state).forEach((f) => {
+      list.appendChild(el('div', { class: 'lab-item' + (state.failure === f.id ? ' active' : '') }, [
+        el('div', {}, [el('strong', {}, f.label), el('p', { class: 'hint' }, f.why)]),
+        el('button', { class: 'btn small', type: 'button', onclick: () => runFailureLab(state, f.id) }, 'Run this scenario')
+      ]));
+    });
+  }
+
+  const REALISM_NOTES = [
+    'Dynamic routing: real routers exchange live routing information (OSPF/IS-IS internally, BGP between networks); this simulator uses fixed, illustrative tables.',
+    'HTTP/2, HTTP/3 and QUIC: modern browsers often skip plain HTTP/1.1 and use these — simplified to one request/response here.',
+    'MAC addresses genuinely change at every routed (Layer-3) hop; IP addresses only change where NAT rewrites them.',
+    'BGP operates between Autonomous Systems, not per packet — the AS-path diagram is a static illustration.',
+    'All IP addresses, AS numbers, routers and the backbone path (R1–R4) are simulated and clearly labelled as such.',
+    'A real page load triggers dozens of additional requests (images, scripts, fonts) and uses caching, retries and CDNs — this simulator follows a single representative request.'
+  ];
+  function renderRealism() {
+    const box = $('#realism-list'); clear(box);
+    REALISM_NOTES.forEach((t) => box.appendChild(el('li', {}, t)));
+  }
+
+  function renderSummary(state) {
+    const body = $('#summary-body'); clear(body);
+    const dest = state.dest;
+    const reqCount = state.packets.filter((p) => p.dir === 'req').length;
+    const respCount = state.packets.filter((p) => p.dir === 'resp').length;
+    const dl = el('dl', { class: 'kv' });
+    [['Destination', dest.name + ' (' + dest.ip + ')'], ['Connection type', state.mode === 'wifi' ? 'Wi-Fi' : 'Mobile data'],
+     ['Steps completed', String(state.stages.length)], ['Simulated packets sent', String(reqCount)], ['Simulated packets returned', String(respCount)]]
+      .forEach(([k, v]) => { dl.appendChild(el('dt', {}, k)); dl.appendChild(el('dd', {}, v)); });
+    body.appendChild(dl);
+    body.appendChild(el('p', {}, '🎉 The request for ' + dest.name + ' completed successfully and returned to ' + state.net.nodes[state.clientId].hostname + '.'));
+  }
+
+  /* ------------------------------------------------------------------------
+   * 7. Controller — state, stage stepping, playback, event wiring, init
+   * ---------------------------------------------------------------------- */
+  function freshState(prev) {
+    const keep = prev && $('#chk-keep').checked;
+    return {
+      mode: prev ? prev.mode : 'wifi',
+      clientId: prev ? prev.clientId : 'pc3',
+      domain: prev ? prev.domain : 'google.com',
+      net: null, dest: null, stages: [], stageIndex: -1, packets: [], currentPacket: null,
+      nat: keep ? prev.nat : makeNatEngine(),
+      dns: keep ? prev.dns : makeDnsEngine(),
+      arp: keep ? prev.arp : makeArpEngine(),
+      natDemo: keep && prev.natDemo ? prev.natDemo : new Set(),
+      currentNat: null, dnsQuery: null, tcpPort: null, serverPort: 443,
+      learning: prev ? prev.learning : false,
+      level: prev ? prev.level : 'beginner',
+      speed: prev ? prev.speed : 1,
+      playing: false, failure: prev ? prev.failure : null, failureExplained: false,
+      selectedNode: null, layerFilter: -1, encapDir: 'send', encapIdx: 0,
+      animToken: 0
+    };
+  }
+
+  function rebuildNetwork(state) {
+    state.dest = destFor(state.domain);
+    state.net = buildNetwork(state.mode, state.clientId, state.dest);
+    state.stages = buildStages(state);
+    state.stageIndex = -1;
+    state.packets = [];
+    state.currentPacket = null;
+    state.currentNat = null;
+    state.dnsQuery = null;
+    state.failureExplained = false;
+    if (state.mode === 'wifi' && state.natDemo.size === 0) state.natDemo.add(state.clientId);
+    renderAll(state);
+  }
+
+  function packetForStage(state, stage) {
+    if (!stage.path || stage.path.length < 2) return null;
+    const client = state.net.nodes[state.net.roles.client];
+    const dest = state.dest;
+    let o = { dir: stage.dir === 'resp' ? 'response' : 'request', kind: stage.kind, path: stage.path, stageId: stage.id, natEntry: state.currentNat };
+    if (stage.kind === 'dns-query' || stage.kind === 'dns-response') {
+      Object.assign(o, { srcIp: client.ip, dstIp: client.dns, srcPort: 53211, dstPort: 53, transport: 'UDP', proto: 'DNS', payload: 'DNS ' + (stage.kind === 'dns-query' ? 'query' : 'response') + ' for ' + dest.name, natEntry: null });
+      if (stage.kind === 'dns-response') { o.srcIp = client.dns; o.dstIp = client.ip; }
+    } else if (stage.kind === 'arp-request' || stage.kind === 'arp-reply') {
+      Object.assign(o, { srcIp: client.ip, dstIp: client.gateway, srcPort: null, dstPort: null, transport: 'ARP', proto: 'ARP', payload: 'ARP ' + (stage.kind === 'arp-request' ? 'request' : 'reply'), natEntry: null });
+    } else {
+      Object.assign(o, {
+        srcIp: client.ip, dstIp: dest.ip, srcPort: state.tcpPort || 50123, dstPort: state.serverPort || 443,
+        transport: 'TCP', proto: stage.kind === 'tls' ? 'TLS 1.3' : stage.kind === 'http' ? 'HTTP (encrypted)' : 'TCP',
+        payload: stage.kind === 'http' ? '(encrypted HTTP bytes — simulated)' : stage.kind === 'tls' ? '(TLS handshake record)' : ''
+      });
+    }
+    return mkPacket(state, o);
+  }
+
+  function enterStage(state, index) {
+    if (index < 0 || index >= state.stages.length) return;
+    state.stageIndex = index;
+    const stage = state.stages[index];
+    if (stage.action) stage.action(state);
+    const pkt = packetForStage(state, stage);
+    if (pkt) { state.currentPacket = pkt; pkt.hopIndex = 0; }
+
+    renderStepPanel(state, stage);
+    renderProgress(state);
+    renderPhaseStrip(state);
+    renderBrowser(state, stage);
+    renderNat(state); renderNatDemo(state); renderDns(state); renderArp(state);
+    renderRoutingTable(state, state.selectedNode);
+    renderInspector(state);
+    renderRealism.done || (renderRealism(), renderRealism.done = true);
+    renderBgp(state); renderCompare(state); renderLabList(state);
+    appendLog(state, '[' + stage.phase + '] ' + stage.title);
+
+    if (stage.path && stage.path.length >= 2) {
+      animateAlong(state, stage.path, stage.dir === 'resp' ? 'resp' : stage.dir === 'req' ? 'req' : 'local', Math.max(250, 900 / state.speed), () => {});
+    } else {
+      const dot = $('#pkt-dot'); if (dot) dot.setAttribute('hidden', '');
+    }
+    // dim inactive PCs except during the local-delivery stage where they're relevant contrast
+    $$('.node-computer', $('#topo-svg'));
+
+    if (stage.id === 'done') {
+      $('#summary-card').hidden = false;
+      renderSummary(state);
+      pause(state);
+      $('#btn-next').disabled = true;
+      $('#btn-start').disabled = true;
+    } else {
+      $('#summary-card').hidden = true;
+    }
+
+    if (state.failure && stage.id === failureBreakId(state) && !state.failureExplained) {
+      state.failureExplained = true;
+      showFailureExplanation(state);
+    }
+  }
+
+  function failureBreakId(state) {
+    const f = failureScenarios(state).find((x) => x.id === state.failure);
+    return f ? f.breakAt : null;
+  }
+  function showFailureExplanation(state) {
+    const f = failureScenarios(state).find((x) => x.id === state.failure);
+    if (!f) return;
+    pause(state);
+    setText($('#step-caption'), '⚠ Failure: ' + f.label);
+    setText($('#step-text'), f.explain);
+    setText($('#step-real'), f.why);
+    setText($('#step-simp'), 'This is an intentionally injected fault for teaching — clear it from the badge above to run normally.');
+    appendLog(state, '⚠ FAILURE LAB: ' + f.label + ' — ' + f.why);
+    $('#btn-next').disabled = true;
+    $('#btn-start').disabled = true;
+    const badge = $('#failure-badge'); badge.hidden = false;
+    setText($('#failure-badge-text'), 'Lab: ' + f.label);
+  }
+
+  function nextStep(state) {
+    if (state.stageIndex + 1 >= state.stages.length) return;
+    enterStage(state, state.stageIndex + 1);
+  }
+
+  function play(state) {
+    if (state.playing) return;
+    if (state.stageIndex + 1 >= state.stages.length) return;
+    state.playing = true;
+    $('#btn-start').disabled = true; $('#btn-pause').disabled = false; $('#btn-next').disabled = true;
+    const step = () => {
+      if (!state.playing) return;
+      if (state.stageIndex + 1 >= state.stages.length || $('#btn-next').disabled && state.failureExplained) { pause(state); return; }
+      nextStep(state);
+      if (state.failureExplained || state.stageIndex + 1 >= state.stages.length) { pause(state); return; }
+      state.playTimer = later(step, Math.max(300, 1400 / state.speed));
+    };
+    step();
+  }
+  function pause(state) {
+    state.playing = false;
+    $('#btn-pause').disabled = true;
+    if (!$('#btn-next').disabled === false) {} // no-op guard
+    $('#btn-start').disabled = state.stageIndex + 1 >= state.stages.length;
+    $('#btn-next').disabled = state.stageIndex + 1 >= state.stages.length || (state.failure && state.failureExplained);
+  }
+  function reset(state) {
+    clearTimers();
+    state.playing = false;
+    const badge = $('#failure-badge'); badge.hidden = true;
+    rebuildNetwork(state);
+    $('#btn-start').disabled = false; $('#btn-pause').disabled = true; $('#btn-next').disabled = false;
+    $('#summary-card').hidden = true;
+    appendLog(state, '↻ Reset.');
+  }
+  function runFailureLab(state, id) {
+    state.failure = id; state.failureExplained = false;
+    reset(state);
+    play(state);
+  }
+
+  function setModeAndRebuild(state, mode) {
+    state.mode = mode;
+    $('#sel-mode').value = mode;
+    renderClientOptions(state);
+    state.clientId = $('#sel-client').value;
+    reset(state);
+  }
+
+  function renderAll(state) {
+    renderClientOptions(state);
+    renderTopology(state);
+    renderNodeInfo(state, null);
+    renderRoutingTable(state, null);
+    renderStepPanel(state, { dir: 'local', title: 'Ready', levels: { beginner: '', intermediate: '', technical: '' }, real: '', simp: '', learn: { what: '', why: '', proto: '', transport: '', port: '', visible: '', changes: '' }, kind: '' });
+    renderProgress(state); renderPhaseStrip(state);
+    renderBrowser(state, null);
+    renderNat(state); renderNatDemo(state); renderDns(state); renderArp(state);
+    renderInspector(state);
+    renderEncap(state);
+    renderBgp(state); renderCompare(state); renderLabList(state);
+    if (!renderRealism.done) { renderRealism(); renderRealism.done = true; }
+    setText($('#tagline-domain'), state.domain);
+    $('#log').textContent === '' && appendLog(state, 'Ready. Choose a connection type and computer, then press Start or Next Step.');
+  }
+
+  function wire(state) {
+    $('#sel-mode').addEventListener('change', (e) => { state.mode = e.target.value; renderClientOptions(state); state.clientId = $('#sel-client').value; reset(state); });
+    $('#sel-client').addEventListener('change', (e) => { state.clientId = e.target.value; reset(state); });
+    $('#btn-start').addEventListener('click', () => play(state));
+    $('#btn-next').addEventListener('click', () => nextStep(state));
+    $('#btn-pause').addEventListener('click', () => pause(state));
+    $('#btn-reset').addEventListener('click', () => reset(state));
+    $('#rng-speed').addEventListener('input', (e) => { state.speed = SPEEDS[+e.target.value]; setText($('#out-speed'), state.speed + '×'); $('#rng-speed').setAttribute('aria-valuetext', state.speed + ' times speed'); });
+    $('#chk-learning').addEventListener('change', (e) => { state.learning = e.target.checked; renderStepPanel(state, state.stages[state.stageIndex] || state.stages[0] || { dir: 'local', title: '', levels: { beginner: '' }, learn: {} }); });
+    $$('input[name="level"]').forEach((r) => r.addEventListener('change', (e) => { if (e.target.checked) { state.level = e.target.value; if (state.stageIndex >= 0) renderStepPanel(state, state.stages[state.stageIndex]); } }));
+    $('#btn-clear-failure').addEventListener('click', () => { state.failure = null; $('#failure-badge').hidden = true; reset(state); });
+    $('#btn-theme').addEventListener('click', () => {
+      const html = document.documentElement;
+      const now = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', now);
+      $('#btn-theme').setAttribute('aria-pressed', String(now === 'light'));
+    });
+    $('#url-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const v = $('#url-input').value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+      if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(v)) {
+        setText($('#url-error'), 'Please enter a realistic domain name, e.g. "google.com" or "example.org".');
+        return;
+      }
+      setText($('#url-error'), '');
+      state.domain = v;
+      reset(state);
+    });
+    $('#btn-clear-log').addEventListener('click', () => { clear($('#log')); });
+    $('#btn-flush-dns').addEventListener('click', () => { state.dns.flush(); renderDns(state); appendLog(state, 'DNS cache flushed.'); });
+    $('#btn-flush-arp').addEventListener('click', () => { state.arp.flush(); state.arp.flushSwitch(); renderArp(state); appendLog(state, 'ARP cache flushed.'); });
+    $('#btn-nat-all').addEventListener('click', () => { for (let i = 1; i <= 5; i++) state.natDemo.add('pc' + i); applyNatDemo(state); renderNatDemo(state); });
+    $('#btn-nat-none').addEventListener('click', () => { state.natDemo = new Set([state.clientId]); applyNatDemo(state); renderNatDemo(state); });
+    $('#insp-select').addEventListener('change', (e) => { const p = state.packets.find((x) => x.id === e.target.value); if (p) { state.currentPacket = p; renderInspector(state); } });
+    $('#insp-prev').addEventListener('click', () => { if (state.currentPacket) { state.currentPacket.hopIndex = Math.max(0, (state.currentPacket.hopIndex || 0) - 1); renderInspector(state); } });
+    $('#insp-next').addEventListener('click', () => { if (state.currentPacket) { const max = (state.currentPacket.path.length - 2); state.currentPacket.hopIndex = Math.min(max, (state.currentPacket.hopIndex || 0) + 1); renderInspector(state); } });
+    $('#encap-send').addEventListener('click', () => { state.encapDir = 'send'; renderEncap(state); });
+    $('#encap-recv').addEventListener('click', () => { state.encapDir = 'recv'; renderEncap(state); });
+    $('#encap-prev').addEventListener('click', () => { state.encapIdx = clamp(state.encapIdx - 1, 0, ENCAP_LAYERS.length - 1); renderEncap(state); });
+    $('#encap-next').addEventListener('click', () => { state.encapIdx = clamp(state.encapIdx + 1, 0, ENCAP_LAYERS.length - 1); renderEncap(state); });
+    $('#encap-anim').addEventListener('click', () => {
+      let i = 0; const dir = state.encapDir === 'send' ? 1 : -1; state.encapIdx = state.encapDir === 'send' ? 0 : ENCAP_LAYERS.length - 1;
+      renderEncap(state);
+      const step = () => { state.encapIdx = clamp(state.encapIdx + dir, 0, ENCAP_LAYERS.length - 1); renderEncap(state); i++; if (i < ENCAP_LAYERS.length - 1) later(step, prefersReducedMotion() ? 40 : 500); };
+      later(step, prefersReducedMotion() ? 40 : 500);
+    });
+    $('#btn-follow').addEventListener('click', (e) => {
+      const on = e.target.getAttribute('aria-pressed') !== 'true';
+      e.target.setAttribute('aria-pressed', String(on));
+      e.target.textContent = on ? 'Following packet' : 'Follow packet: off';
+    });
+    $('#lab-loss').addEventListener('change', () => {});
+    $$('[data-act]').forEach((btn) => btn.addEventListener('click', (e) => {
+      const act = e.currentTarget.getAttribute('data-act');
+      if (act === 'replay') reset(state);
+      else if (act === 'compare') $('#compare-card').scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+      else if (act === 'lab') $('#lab-card').scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+      else if (act === 'packets') $('#inspector-card').scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    }));
+  }
+
+  function init() {
+    const state = freshState(null);
+    wire(state);
+    rebuildNetwork(state);
+    $('#btn-pause').disabled = true;
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
