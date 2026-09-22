@@ -92,3 +92,8 @@ make the *shape* of that journey visible and inspectable, not to reproduce
 any specific real connection. The footer of the app repeats this note, and
 every step explicitly separates the real networking concept it teaches from
 the simplification the simulator makes to show it.
+
+> **See the Internet. Don't just use it.**
+
+This project is a conceptual networking simulator.
+<p align="center"> <a href="https://kidhacker45.github.io/Internet_Journey_Simulator/"> <img src="https://img.shields.io/badge/🌐%20Launch%20Internet%20Journey%20Simulator-Visit%20Live%20Demo-blue?style=for-the-badge" alt="Launch Internet Journey Simulator"> </a> </p>
