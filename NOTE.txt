@@ -1,0 +1,892 @@
+# Internet Journey Simulator
+
+Interactive visualization of what happens when you type `google.com` —
+from the browser, through DNS, ARP, your router, NAT, your ISP, the
+Internet, TCP and TLS, to a Google server — and **all the way back** to
+the exact computer that asked.
+
+Built for cybersecurity / networking students. 100% static: no backend,
+no database, no build step, no libraries.
+
+## Features
+
+- Wi-Fi simulation with a shared router
+- 5-client LAN (selectable, inspectable clients)
+- Mobile data simulation (cell tower, mobile core, CGNAT)
+- DNS (cache, query, simulated recursive resolver)
+- ARP
+- DHCP (explained)
+- NAT (translation table, multi-client demo, response mapping)
+- Routing (home router, ISP, simulated Internet routers)
+- BGP concepts (AS-to-AS reachability, simulated)
+- TCP three-way handshake
+- TLS 1.3 handshake
+- HTTPS encrypted request / response
+- Response path with NAT reverse lookup to the correct PC
+- Packet inspector (L2 / L3 / L4 / L7 + lifecycle)
+- Event log
+- Failure laboratory (DNS / gateway / NAT / loss / TCP timeout / TLS)
+- Learning mode + Beginner / Intermediate / Technical explanations
+- Wi-Fi vs Mobile comparison
+- Step-by-step mode, auto-play, speed control (0.5x–4x)
+- Keyboard accessible, reduced-motion support, responsive
+
+## Run locally
+
+Open `index.html` directly in a browser, or:
+# 🌐 Internet Journey Simulator
+
+```bash
+python3 -m http.server 8000
+> **What really happens when you type `google.com` and press Enter?**
+
+**Internet Journey Simulator** is an interactive educational networking simulator that visually demonstrates how a web request travels from a user's computer to a remote server and how the response finds its way back to the **correct computer**.
+
+The project is designed for **cybersecurity students, networking beginners, ethical hackers, and anyone who wants to understand what happens behind a browser request.**
+
+🌐 **Live Demo:** `https://YOUR-USERNAME.github.io/internet-journey-simulator/`
+
+---
+
+## 🎯 What Does This Project Teach?
+
+When you type:
+
+```text
+google.com
+```
+
+Then visit:
+many networking processes happen before the page appears.
+
+This simulator breaks that journey into understandable stages:
+
+```text
+                    REQUEST
+                       │
+                       ▼
+                💻 Client PC
+                       │
+                 DNS / ARP
+                       │
+                       ▼
+                📡 Wi-Fi Router
+                       │
+                     NAT
+                       │
+                       ▼
+                  🏢 ISP
+                       │
+                       ▼
+                🌐 Internet
+                       │
+                 BGP / Routing
+                       │
+                       ▼
+                 🏢 Google Edge
+                       │
+                       ▼
+                🖥️ Google Server
+                       │
+                       │
+                  RESPONSE
+                       │
+                       ▼
+                🌐 Internet
+                       │
+                       ▼
+                    ISP
+                       │
+                       ▼
+                 NAT Router
+                       │
+                       ▼
+                💻 Correct PC
+                       │
+                       ▼
+                  🌐 Browser
+```
+http://localhost:8000
+
+The simulator focuses heavily on an important question:
+
+> **If five computers share the same Wi-Fi router, how does the response get back to the computer that actually requested it?**
+
+---
+
+# ✨ Features
+
+## 📶 Wi-Fi Network Simulation
+
+Choose **Wi-Fi mode** to create a local network containing five computers:
+
+```text
+                    📡 Router
+                  192.168.1.1
+                       │
+        ┌──────────────┼──────────────┐
+        │      │       │       │      │
+        ▼      ▼       ▼       ▼      ▼
+       PC1    PC2     PC3     PC4    PC5
+       .20    .21     .22     .23    .24
+```
+
+## GitHub Pages
+You can select any computer as the client.
+
+1. Push this repository to GitHub
+2. Open **Settings**
+3. Go to **Pages**
+4. Select the `main` branch (root)
+5. Save
+For example:
+
+The site will be live at:
+```text
+Selected Computer: PC3
+
+IP:
+192.168.1.22
+```
+https://USERNAME.github.io/internet-journey-simulator/
+
+PC3 becomes the machine that requests `google.com`.
+
+---
+
+## 📱 Mobile Data Simulation
+
+Switch from Wi-Fi to **Mobile Data** to see a different network architecture:
+
+```text
+             💻 Client
+                 │
+                 ▼
+             📡 Cell Tower
+                 │
+                 ▼
+            🏢 Mobile Core
+                 │
+                 ▼
+               CGNAT
+                 │
+                 ▼
+                ISP
+                 │
+                 ▼
+              Internet
+                 │
+                 ▼
+               Google
+```
+
+## Project structure
+The simulator demonstrates concepts such as:
+
+* Cellular access
+* Mobile core networks
+* Carrier-grade NAT
+* Public/private addressing
+* Internet routing
+
+---
+
+# 🧩 Networking Concepts
+
+The simulator covers several important networking technologies.
+
+### DNS
+
+Learn how:
+
+```text
+google.com
+     ↓
+DNS
+     ↓
+IP address
+```
+
+DNS converts human-readable domain names into IP addresses.
+
+---
+
+### DHCP
+
+Understand how a device can receive network configuration such as:
+
+```text
+IP address
+Subnet mask
+Default gateway
+DNS server
+```
+
+---
+
+### ARP
+
+See how a local IPv4 device can discover the MAC address associated with the local gateway.
+
+Example:
+
+```text
+PC3:
+
+Who has 192.168.1.1?
+
+        ↓
+
+Router:
+
+192.168.1.1 is at
+AA:BB:CC:DD:EE:01
+```
+
+---
+
+### Routing
+
+See how routers make forwarding decisions based on destination IP addresses.
+
+```text
+Destination       Next Hop
+────────────────────────────
+192.168.1.0/24    LAN
+0.0.0.0/0         ISP
+```
+
+---
+
+### NAT
+
+One of the major concepts demonstrated by the simulator.
+
+Five computers can share a public IPv4 address.
+
+Example:
+
+```text
+192.168.1.20:50001
+        ↓
+203.0.113.10:40001
+
+192.168.1.21:50002
+        ↓
+203.0.113.10:40002
+
+192.168.1.22:50003
+        ↓
+203.0.113.10:40003
+```
+
+This helps demonstrate how the router keeps track of multiple simultaneous connections.
+
+---
+
+# 🔄 Understanding the Response
+
+The simulator doesn't stop when the request reaches the server.
+
+It also demonstrates the **return journey**.
+
+Example:
+
+```text
+REQUEST
+
+PC3
+ ↓
+Router
+ ↓
+NAT
+ ↓
+ISP
+ ↓
+Internet
+ ↓
+Google
+```
+
+Then:
+
+```text
+RESPONSE
+
+Google
+ ↓
+Internet
+ ↓
+ISP
+ ↓
+NAT
+ ↓
+Router
+ ↓
+PC3
+```
+
+The simulator displays the NAT mapping that allows the router to associate the incoming traffic with the correct internal connection.
+
+---
+
+# 🔐 TCP & TLS
+
+The simulator demonstrates the traditional TCP connection process:
+
+```text
+Client                         Server
+
+SYN ─────────────────────────>
+
+    <────────────────── SYN-ACK
+
+ACK ─────────────────────────>
+```
+
+Then it demonstrates TLS:
+
+```text
+Client
+  │
+  │ ClientHello
+  ▼
+Server
+  │
+  │ ServerHello
+  │ Certificate
+  ▼
+Client
+  │
+  │ Key establishment
+  ▼
+Encrypted connection
+```
+
+The simulator uses simulated values for educational purposes.
+
+---
+
+# 🌍 Internet Backbone
+
+The project includes a simplified Internet backbone:
+
+```text
+Home Router
+     │
+     ▼
+ISP Router
+     │
+     ▼
+Transit Router
+     │
+     ▼
+Internet Router
+     │
+     ▼
+Google Edge
+```
+
+It also introduces the concept of **Autonomous Systems and BGP**.
+
+Example:
+
+```text
+AS64500
+  ISP
+   │
+   ▼
+AS64501
+Transit
+   │
+   ▼
+Google Network
+```
+
+> The displayed routes are simulated and are not intended to represent a real-time route to Google's infrastructure.
+
+---
+
+# 📦 Packet Inspector
+
+Click packets during the simulation to inspect their contents.
+
+Example:
+
+```text
+PACKET INSPECTOR
+
+Layer 2
+────────────────────
+Source MAC:
+02:42:AC:11:00:22
+
+Destination MAC:
+AA:BB:CC:DD:EE:01
+
+
+Layer 3
+────────────────────
+Source IP:
+192.168.1.22
+
+Destination IP:
+142.250.x.x
+
+
+Layer 4
+────────────────────
+Protocol:
+TCP
+
+Source Port:
+52143
+
+Destination Port:
+443
+```
+
+The inspector changes as the packet moves through the simulated network.
+
+---
+
+# 🧱 Encapsulation
+
+The simulator demonstrates protocol encapsulation:
+
+```text
+Application Data
+       ↓
+TCP Segment
+       ↓
+IP Packet
+       ↓
+Wi-Fi / Ethernet Frame
+```
+
+At the destination:
+
+```text
+Wi-Fi / Ethernet Frame
+       ↓
+IP Packet
+       ↓
+TCP Segment
+       ↓
+Application Data
+```
+
+This helps connect the simulator with the OSI and TCP/IP models.
+
+---
+
+# 🧪 Failure Laboratory
+
+The simulator includes optional failure scenarios.
+
+## DNS Failure
+
+```text
+DNS unavailable
+        ↓
+google.com cannot be resolved
+```
+
+## Router Failure
+
+```text
+Gateway unavailable
+        ↓
+Local network may work
+Internet unavailable
+```
+
+## NAT Failure
+
+```text
+Request leaves
+        ↓
+Response arrives
+        ↓
+No valid NAT mapping
+        ↓
+Correct internal client cannot be identified
+```
+
+## Packet Loss
+
+```text
+Packet
+  ↓
+X LOST
+
+Retransmission
+  ↓
+Packet sent again
+```
+
+## TCP Timeout
+
+```text
+SYN
+ ↓
+No response
+ ↓
+Retry
+ ↓
+Timeout
+```
+
+## TLS Failure
+
+```text
+Certificate validation failure
+        ↓
+HTTPS connection aborted
+```
+
+---
+
+# 🎓 Learning Modes
+
+The simulator supports different explanation levels.
+
+### Beginner
+
+Simple explanations:
+
+> DNS finds the IP address belonging to a domain name.
+
+### Intermediate
+
+More technical terminology:
+
+> The client sends a DNS query to its configured resolver.
+
+### Technical
+
+Detailed networking terminology:
+
+> The stub resolver submits a query to the configured recursive resolver. Depending on configuration, DNS may use UDP/TCP port 53 or encrypted DNS transports.
+
+---
+
+# 🔬 Simulation vs Real Internet
+
+This project intentionally uses a **simulation model**.
+
+Real Internet traffic is considerably more complex.
+
+For example:
+
+* DNS configuration differs between networks.
+* Browsers may use HTTP/3 and QUIC instead of TCP.
+* Google operates distributed infrastructure.
+* Internet routing changes dynamically.
+* NAT behavior varies by implementation.
+* Different ISPs use different architectures.
+* The exact route between two endpoints can change.
+* A webpage can require many additional requests after the initial connection.
+
+Therefore, addresses, routes, servers, AS paths, and packet values shown by this project are **illustrative**.
+
+The objective is to teach the underlying concepts rather than reproduce Google's actual production network.
+
+---
+
+# 🛠️ Technology
+
+The project is intentionally lightweight.
+
+```text
+HTML5
+CSS3
+JavaScript
+SVG
+```
+
+No backend is required.
+
+No database is required.
+
+No authentication is required.
+
+The application can run entirely as a static website.
+
+---
+
+# 📁 Project Structure
+
+```text
+internet-journey-simulator/
+├── index.html          markup, panels, SVG host
+├── style.css           dark lab theme, responsive, a11y
+├── app.js              model (devices/packets/NAT/DNS/ARP) + renderer
+│
+├── index.html
+├── style.css
+├── app.js
+├── README.md
+│
+└── assets/
+   └── icons/
+        └── icon.svg
+```
+
+## Educational purpose
+---
+
+# 🚀 Run Locally
+
+Clone the repository:
+
+```bash
+git clone https://github.com/YOUR-USERNAME/internet-journey-simulator.git
+```
+
+Enter the project:
+
+```bash
+cd internet-journey-simulator
+```
+
+You can simply open:
+
+```text
+index.html
+```
+
+Or run a local HTTP server:
+
+```bash
+python3 -m http.server 8000
+```
+
+Then open:
+
+```text
+http://localhost:8000
+```
+
+---
+
+# 🌐 Deploy to GitHub Pages
+
+### 1. Create a repository
+
+Create:
+
+```text
+internet-journey-simulator
+```
+
+### 2. Upload the project
+
+```bash
+git init
+git add .
+git commit -m "Initial Internet Journey Simulator"
+git branch -M main
+git remote add origin https://github.com/YOUR-USERNAME/internet-journey-simulator.git
+git push -u origin main
+```
+
+### 3. Enable GitHub Pages
+
+Go to:
+
+```text
+Repository
+→ Settings
+→ Pages
+```
+
+Under:
+
+```text
+Build and deployment
+```
+
+select:
+
+```text
+Source:
+Deploy from a branch
+
+Branch:
+main
+/(root)
+```
+
+Save.
+
+GitHub will generate the website at:
+
+```text
+https://YOUR-USERNAME.github.io/internet-journey-simulator/
+```
+
+---
+
+# 🧠 Learning Path
+
+A recommended learning sequence is:
+
+```text
+1. Computer & Network
+        ↓
+2. IP Address
+        ↓
+3. DHCP
+        ↓
+4. MAC Address
+        ↓
+5. ARP
+        ↓
+6. DNS
+        ↓
+7. Router
+        ↓
+8. NAT
+        ↓
+9. ISP
+        ↓
+10. Routing
+        ↓
+11. BGP
+        ↓
+12. TCP
+        ↓
+13. TLS
+        ↓
+14. HTTPS
+        ↓
+15. Server
+        ↓
+16. Response
+        ↓
+17. Browser Rendering
+```
+
+---
+
+# 🎯 Learning Objective
+
+After completing the simulation, you should be able to answer:
+
+### What happens when I type `google.com`?
+
+You should understand:
+
+* How a domain becomes an IP address
+* How a computer gets network configuration
+* How the local gateway is discovered
+* How packets leave the local network
+* How NAT works
+* How ISPs connect users to the Internet
+* How routers forward traffic
+* What BGP does
+* How TCP establishes a connection
+* What TLS does
+* How HTTPS protects application data
+* How the server receives the request
+* How the response travels back
+* How NAT identifies the correct internal client
+* How the browser receives and renders the response
+
+---
+
+# 👨‍💻 Who Is This For?
+
+This project is useful for:
+
+* Cybersecurity students
+* Networking students
+* Ethical hackers
+* Penetration testers
+* SOC analysts
+* System administrators
+* Computer science students
+* Beginners learning the Internet
+* Anyone curious about what happens behind a browser
+
+---
+
+# ⚠️ Educational Disclaimer
+
+This is an educational simulation.
+
+It does **not** reproduce Google's actual internal infrastructure or a user's real Internet route.
+
+All IP addresses, MAC addresses, routers, NAT mappings, AS paths, server locations, and packet flows shown by the simulator may be simulated or illustrative.
+
+The purpose is to provide an understandable model of common networking concepts.
+
+---
+
+# 🤝 Contributing
+
+Contributions are welcome.
+
+Possible improvements include:
+
+* IPv6 simulation
+* HTTP/3 and QUIC
+* DNS-over-HTTPS
+* DNS-over-TLS
+* TLS certificate inspection
+* IPv6 Neighbor Discovery
+* VPN simulation
+* Proxy simulation
+* Firewall simulation
+* CDN simulation
+* Load balancer simulation
+* WebSocket simulation
+* Real traceroute integration
+* PCAP-style packet viewer
+* More networking failure scenarios
+* Interactive OSI model
+* Network attack demonstrations in a safe educational environment
+
+To contribute:
+
+```bash
+git fork
+git clone
+git checkout -b feature/my-feature
+git commit
+git push
+```
+
+Then open a Pull Request.
+
+---
+
+# 📜 License
+
+Choose a license appropriate for your project.
+
+For example:
+
+```text
+MIT License
+```
+
+---
+
+# ⭐ Support the Project
+
+If this simulator helped you understand networking:
+
+⭐ Star the repository
+🍴 Fork the project
+🐛 Report bugs
+💡 Suggest improvements
+🤝 Contribute new simulations
+
+---
+
+## 🌐 Internet Journey Simulator
+
+**From `google.com` → DNS → Router → NAT → ISP → Internet → Server → Response → Your Computer.**
+
